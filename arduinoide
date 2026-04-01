@@ -1,0 +1,367 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MLX90614.h>
+
+#define SDA_PIN              40
+#define SCL_PIN              39
+#define REPORT_MS            1000
+#define OLED_WIDTH           128
+#define OLED_HEIGHT          64
+#define OLED_ADDR            0x3C
+#define OLED_RESET           -1
+#define IR_FINGER_THRESHOLD  50000UL
+#define FINGER_CONFIRM_COUNT 5
+#define WAVE_LEN             64
+
+Adafruit_SSD1306  display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
+MAX30105          sensor;
+Adafruit_MLX90614 mlx;
+
+uint32_t irBuffer[100];
+uint32_t redBuffer[100];
+
+const byte RATE_SIZE = 8;
+byte   rates[RATE_SIZE];
+byte   rateSpot       = 0;
+long   lastBeat       = 0;
+float  beatsPerMinute = 0;
+int    beatAvg        = 0;
+
+int32_t spo2         = 0;
+int8_t  validSPO2    = 0;
+int32_t heartRate_mx = 0;
+int8_t  validHR_mx   = 0;
+
+int   goodCount      = 0;
+bool  fingerDetected = false;
+float tempC          = 0.0;   // nhiệt độ đối tượng (da)
+bool  mlxOK          = false;
+
+int16_t waveBuffer[WAVE_LEN];
+uint8_t waveIdx    = 0;
+uint8_t heartFrame = 0;
+
+// ── Đọc nhiệt độ GY-906 ───────────────────────
+void readTemp() {
+  if (!mlxOK) return;
+  float t = mlx.readObjectTempC();
+  // Lọc giá trị bất thường
+  if (t > 25.0 && t < 45.0) {
+    tempC = tempC * 0.7 + t * 0.3;  // smooth
+  }
+}
+
+bool detectFinger(uint32_t ir) {
+  if (ir > IR_FINGER_THRESHOLD) {
+    if (++goodCount >= FINGER_CONFIRM_COUNT) return true;
+  } else {
+    goodCount = 0;
+  }
+  return false;
+}
+
+void fillBuffer() {
+  for (byte i = 0; i < 100; i++) {
+    while (!sensor.available()) sensor.check();
+    redBuffer[i] = sensor.getRed();
+    irBuffer[i]  = sensor.getIR();
+    sensor.nextSample();
+  }
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer, 100, redBuffer,
+    &spo2, &validSPO2, &heartRate_mx, &validHR_mx
+  );
+}
+
+// ── Vẽ OLED ───────────────────────────────────
+void drawOLED(int hr, int sp, float temp, bool finger) {
+  display.clearDisplay();
+
+  if (!finger) {
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(20, 0);
+    display.print("SepsisAI Monitor");
+    display.setTextSize(1);
+    display.setCursor(0, 14);
+    display.print("Temp: ");
+    if (mlxOK && temp > 0) {
+      display.print(temp, 1);
+      display.print(" C");
+    } else {
+      display.print("-- C");
+    }
+    display.setTextSize(2);
+    display.setCursor(10, 32);
+    display.print("Place");
+    display.setCursor(10, 50);
+    display.print("Finger");
+    static uint8_t blinkCnt = 0;
+    blinkCnt++;
+    if (blinkCnt % 2 == 0) {
+      display.fillRect(120, 50, 4, 4, SSD1306_WHITE);
+    }
+
+  } else {
+    // ── Vùng vàng: header ─────────────────────
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("SepsisAI");
+    display.setCursor(88, 0);
+    display.print(heartFrame < 10 ? "<3" : "  ");
+
+    // Nhiệt độ góc phải
+    if (mlxOK && temp > 0) {
+      display.setCursor(96, 0);
+      // Hiển thị cảnh báo sốt
+      if (temp >= 38.3) {
+        display.print("FEVER");
+      } else {
+        display.print(temp, 1);
+      }
+    }
+
+    // ── Vùng xanh: vitals ─────────────────────
+
+    // HR
+    display.setTextSize(1);
+    display.setCursor(0, 10);
+    display.print("HR");
+    display.setTextSize(2);
+    display.setCursor(0, 19);
+    if (hr > 0) display.print(hr);
+    else        display.print("--");
+    display.setTextSize(1);
+    display.setCursor(0, 36);
+    display.print("bpm");
+
+    display.drawFastVLine(38, 9, 46, SSD1306_WHITE);
+
+    // SpO2
+    display.setTextSize(1);
+    display.setCursor(42, 10);
+    display.print("SpO2");
+    display.setTextSize(2);
+    display.setCursor(42, 19);
+    if (sp > 0) display.print(sp);
+    else        display.print("--");
+    display.setTextSize(1);
+    display.setCursor(42, 36);
+    display.print("%");
+
+    display.drawFastVLine(78, 9, 46, SSD1306_WHITE);
+
+    // Temp
+    display.setTextSize(1);
+    display.setCursor(82, 10);
+    display.print("Temp");
+    display.setTextSize(1);
+    display.setCursor(82, 22);
+    if (mlxOK && temp > 0) {
+      display.print(temp, 1);
+      display.setCursor(82, 32);
+      display.print("C");
+    } else {
+      display.print("--");
+    }
+
+    // Status bar
+    display.drawFastHLine(0, 46, 128, SSD1306_WHITE);
+
+    // Status text
+    display.setCursor(0, 49);
+    if (sp > 0 && sp < 90) {
+      display.print("!! SpO2 CRITICAL !!");
+    } else if (mlxOK && temp >= 38.3 && hr > 100) {
+      display.print("!! SEPSIS RISK    !!");
+    } else if (mlxOK && temp >= 38.3) {
+      display.print("!! FEVER DETECTED !!");
+    } else if (hr > 130) {
+      display.print("!! TACHYCARDIA    !!");
+    } else if (hr >= 40 && sp > 94) {
+      display.print("Status: NORMAL :)   ");
+    } else {
+      display.print("Status: Measuring...");
+    }
+
+    // ── PPG waveform mini ──────────────────────
+    int16_t wMin = waveBuffer[0], wMax = waveBuffer[0];
+    for (uint8_t i = 1; i < WAVE_LEN; i++) {
+      if (waveBuffer[i] < wMin) wMin = waveBuffer[i];
+      if (waveBuffer[i] > wMax) wMax = waveBuffer[i];
+    }
+    if (wMax - wMin < 1) wMax = wMin + 1;
+
+    // Vẽ waveform nhỏ phía dưới cùng (56-63)
+    for (uint8_t i = 1; i < WAVE_LEN; i++) {
+      uint8_t xi = (uint8_t)map(i,   0, WAVE_LEN-1, 0, 77);
+      uint8_t xp = (uint8_t)map(i-1, 0, WAVE_LEN-1, 0, 77);
+      uint8_t yi = (uint8_t)map(waveBuffer[(waveIdx+i)   % WAVE_LEN], wMin, wMax, 63, 57);
+      uint8_t yp = (uint8_t)map(waveBuffer[(waveIdx+i-1) % WAVE_LEN], wMin, wMax, 63, 57);
+      display.drawLine(xp, yp, xi, yi, SSD1306_WHITE);
+    }
+  }
+
+  display.display();
+  heartFrame = (heartFrame + 1) % 20;
+}
+
+// ═══════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+
+  // ── OLED ──────────────────────────────────
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("{\"error\":\"OLED_NOT_FOUND\"}");
+  } else {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setCursor(10, 6);
+    display.print("SepsisAI");
+    display.setTextSize(1);
+    display.setCursor(18, 28);
+    display.print("AI Sepsis Monitor");
+    display.setCursor(28, 42);
+    display.print("Starting...");
+    display.display();
+    delay(1500);
+  }
+
+  // ── GY-906 MLX90614 ───────────────────────
+  if (!mlx.begin()) {
+    Serial.println("{\"warning\":\"GY906_NOT_FOUND\"}");
+    mlxOK = false;
+  } else {
+    mlxOK = true;
+    tempC = mlx.readObjectTempC();
+    Serial.println("{\"status\":\"GY906_OK\"}");
+  }
+
+  // ── MAX30102 ──────────────────────────────
+  if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("{\"error\":\"MAX30102_NOT_FOUND\"}");
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 10); display.print("ERROR:");
+    display.setCursor(0, 25); display.print("MAX30102");
+    display.setCursor(0, 40); display.print("Not Found!");
+    display.display();
+    while (1) delay(1000);
+  }
+
+  sensor.setup(60, 4, 2, 400, 411, 16384);
+  sensor.setPulseAmplitudeRed(0x0A);
+  sensor.setPulseAmplitudeGreen(0);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Sensors OK!");
+  display.setCursor(0, 12);
+  display.print(mlxOK ? "GY-906: OK" : "GY-906: N/A");
+  display.setCursor(0, 24);
+  display.print("MAX30102: OK");
+  display.setCursor(0, 38);
+  display.print("Place finger...");
+  display.display();
+  delay(1000);
+
+  Serial.println("{\"status\":\"ESP_READY\"}");
+  fillBuffer();
+  memset(waveBuffer, 0, sizeof(waveBuffer));
+}
+
+// ═══════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════
+void loop() {
+  static uint32_t lastReport = 0;
+  static uint32_t lastOLED   = 0;
+  static uint32_t lastTemp   = 0;
+
+  // ── Đọc nhiệt độ mỗi 1 giây ──────────────
+  if (millis() - lastTemp >= 1000) {
+    lastTemp = millis();
+    readTemp();
+  }
+
+  // ── Slide buffer ──────────────────────────
+  for (byte i = 25; i < 100; i++) {
+    redBuffer[i - 25] = redBuffer[i];
+    irBuffer[i - 25]  = irBuffer[i];
+  }
+
+  for (byte i = 75; i < 100; i++) {
+    while (!sensor.available()) sensor.check();
+
+    uint32_t rawIR  = sensor.getIR();
+    uint32_t rawRed = sensor.getRed();
+    sensor.nextSample();
+
+    redBuffer[i] = rawRed;
+    irBuffer[i]  = rawIR;
+
+    fingerDetected = detectFinger(rawIR);
+
+    waveBuffer[waveIdx] = (int16_t)(rawIR >> 8);
+    waveIdx = (waveIdx + 1) % WAVE_LEN;
+
+    if (fingerDetected && checkForBeat(rawIR)) {
+      long delta     = millis() - lastBeat;
+      lastBeat       = millis();
+      beatsPerMinute = 60.0f / (delta / 1000.0f);
+      if (beatsPerMinute > 20 && beatsPerMinute < 200) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
+        beatAvg /= RATE_SIZE;
+      }
+    }
+  }
+
+  // ── SpO2 ──────────────────────────────────
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer, 100, redBuffer,
+    &spo2, &validSPO2, &heartRate_mx, &validHR_mx
+  );
+
+  int  outHR   = (beatAvg > 0) ? beatAvg : (validHR_mx ? heartRate_mx : 0);
+  int  outSpO2 = validSPO2 ? spo2 : 0;
+  long outPPG  = (long)irBuffer[99];
+
+  // ── OLED 200ms ────────────────────────────
+  if (millis() - lastOLED >= 200) {
+    lastOLED = millis();
+    drawOLED(outHR, outSpO2, tempC, fingerDetected);
+  }
+
+  // ── JSON Serial 1s ────────────────────────
+  if (millis() - lastReport >= REPORT_MS) {
+    lastReport = millis();
+    Serial.print("{");
+    Serial.print("\"finger\":"); Serial.print(fingerDetected ? "true" : "false");
+    Serial.print(",\"hr\":");    Serial.print(outHR);
+    Serial.print(",\"spo2\":"); Serial.print(outSpO2);
+    Serial.print(",\"temp\":"); Serial.print(tempC, 1);
+    Serial.print(",\"ppg\":");  Serial.print(outPPG);
+    Serial.println("}");
+
+    if (!fingerDetected) {
+      beatAvg = 0; beatsPerMinute = 0;
+      rateSpot = 0;
+      memset(rates, 0, sizeof(rates));
+    }
+  }
+}
