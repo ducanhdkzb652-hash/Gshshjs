@@ -1,6 +1,11 @@
 # ================================================================
-#  AI SEPSIS MONITOR - PROFESSIONAL EDITION
-#  Nhiệt độ đọc từ GY-906 qua ESP32 (không nhập tay)
+
+# AI SEPSIS MONITOR - PROFESSIONAL EDITION
+
+# Thong bao: Telegram + SpeedSMS + Gmail
+
+# Nhiet do: GY-906 tu dong qua ESP32
+
 # ================================================================
 
 import serial
@@ -10,7 +15,9 @@ import threading
 import numpy as np
 import tkinter as tk
 from tkinter import ttk, messagebox
-import csv, os, time, sqlite3, requests, winsound
+import csv, os, time, sqlite3, requests, winsound, base64
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -24,716 +31,900 @@ import tensorflow as tf
 import joblib
 
 # ================= CONFIG =================
+
 BAUDRATE       = 115200
 WINDOW         = 100
 SAMPLE_RATE    = 100
 CONFIRM_SEC    = 4
 ALERT_COOLDOWN = 30
-MODEL_DL_PATH  = "cnn_bilstm_attention.h5"
-MODEL_XGB_PATH = "xgb_sepsis.pkl"
-DB_PATH        = "sepsis_patients.db"
-DATA_DIR       = Path("patient_data")
+MODEL_DL_PATH  = “cnn_bilstm_attention.h5”
+MODEL_XGB_PATH = “xgb_sepsis.pkl”
+DB_PATH        = “sepsis_patients.db”
+DATA_DIR       = Path(“patient_data”)
 DATA_DIR.mkdir(exist_ok=True)
 
-ZALO_TOKEN   = ""
-ZALO_PHONE   = ""
-ESMS_API_KEY = ""
-ESMS_SECRET  = ""
-ESMS_PHONE   = ""
+# ── Thong bao ────────────────────────────────────────────────
+
+TELEGRAM_TOKEN   = “”   # token tu @BotFather
+TELEGRAM_CHAT_ID = “”   # chat ID cua ban
+
+SPEEDSMS_TOKEN  = “”    # token tu speedsms.vn
+SPEEDSMS_PHONE  = “”    # SDT nhan SMS (0901234567)
+SPEEDSMS_SENDER = “SepsisAI”
+
+GMAIL_USER = “”         # your@gmail.com
+GMAIL_PASS = “”         # App Password 16 ky tu
+GMAIL_TO   = “”         # SDT/email nhan canh bao
 
 # ================= LOAD MODELS =================
+
 try:
-    dl_model = tf.keras.models.load_model(MODEL_DL_PATH)
-    print("✅ DL Model loaded")
+dl_model = tf.keras.models.load_model(MODEL_DL_PATH)
+print(“✅ DL Model loaded”)
 except Exception as e:
-    dl_model = None
-    print(f"⚠️ DL: {e}")
+dl_model = None
+print(f”⚠️ DL: {e}”)
 
 try:
-    xgb_model = joblib.load(MODEL_XGB_PATH)
-    print("✅ XGBoost loaded")
+xgb_model = joblib.load(MODEL_XGB_PATH)
+print(“✅ XGBoost loaded”)
 except Exception:
-    xgb_model = None
+xgb_model = None
 
 # ================================================================
-#  DATABASE
+
+# DATABASE
+
 # ================================================================
+
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS patients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL, dob TEXT, gender TEXT,
-            phone TEXT, address TEXT, note TEXT,
-            created TEXT DEFAULT (datetime('now','localtime'))
-        )""")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            patient_id INTEGER, start_time TEXT, end_time TEXT,
-            avg_hr REAL, avg_spo2 REAL, avg_temp REAL,
-            risk_rate REAL, conclusion TEXT,
-            FOREIGN KEY(patient_id) REFERENCES patients(id)
-        )""")
-    con.commit(); con.close()
+con = sqlite3.connect(DB_PATH)
+cur = con.cursor()
+cur.execute(”””
+CREATE TABLE IF NOT EXISTS patients (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+name TEXT NOT NULL, dob TEXT, gender TEXT,
+phone TEXT, address TEXT, note TEXT,
+created TEXT DEFAULT (datetime(‘now’,‘localtime’))
+)”””)
+cur.execute(”””
+CREATE TABLE IF NOT EXISTS sessions (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+patient_id INTEGER, start_time TEXT, end_time TEXT,
+avg_hr REAL, avg_spo2 REAL, avg_temp REAL,
+risk_rate REAL, conclusion TEXT,
+FOREIGN KEY(patient_id) REFERENCES patients(id)
+)”””)
+con.commit(); con.close()
 
 def get_patients():
-    con  = sqlite3.connect(DB_PATH)
-    rows = con.execute("SELECT id,name,dob,gender,phone FROM patients ORDER BY name").fetchall()
-    con.close(); return rows
+con  = sqlite3.connect(DB_PATH)
+rows = con.execute(
+“SELECT id,name,dob,gender,phone FROM patients ORDER BY name”
+).fetchall()
+con.close(); return rows
 
 def add_patient(name, dob, gender, phone, address, note):
-    con = sqlite3.connect(DB_PATH)
-    con.execute("INSERT INTO patients(name,dob,gender,phone,address,note) VALUES(?,?,?,?,?,?)",
-                (name,dob,gender,phone,address,note))
-    con.commit()
-    pid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-    con.close(); return pid
+con = sqlite3.connect(DB_PATH)
+con.execute(
+“INSERT INTO patients(name,dob,gender,phone,address,note) VALUES(?,?,?,?,?,?)”,
+(name,dob,gender,phone,address,note))
+con.commit()
+pid = con.execute(“SELECT last_insert_rowid()”).fetchone()[0]
+con.close(); return pid
 
 def save_session(pid, start, end, avg_hr, avg_spo2, avg_temp, risk_rate, conclusion):
-    con = sqlite3.connect(DB_PATH)
-    con.execute("""INSERT INTO sessions
-        (patient_id,start_time,end_time,avg_hr,avg_spo2,avg_temp,risk_rate,conclusion)
-        VALUES(?,?,?,?,?,?,?,?)""",
-        (pid,start,end,avg_hr,avg_spo2,avg_temp,risk_rate,conclusion))
-    con.commit(); con.close()
+con = sqlite3.connect(DB_PATH)
+con.execute(””“INSERT INTO sessions
+(patient_id,start_time,end_time,avg_hr,avg_spo2,avg_temp,risk_rate,conclusion)
+VALUES(?,?,?,?,?,?,?,?)”””,
+(pid,start,end,avg_hr,avg_spo2,avg_temp,risk_rate,conclusion))
+con.commit(); con.close()
 
 def get_sessions(pid):
-    con  = sqlite3.connect(DB_PATH)
-    rows = con.execute("""SELECT start_time,avg_hr,avg_spo2,avg_temp,risk_rate,conclusion
-        FROM sessions WHERE patient_id=? ORDER BY start_time DESC LIMIT 20""", (pid,)).fetchall()
-    con.close(); return rows
+con  = sqlite3.connect(DB_PATH)
+rows = con.execute(””“SELECT start_time,avg_hr,avg_spo2,avg_temp,risk_rate,conclusion
+FROM sessions WHERE patient_id=?
+ORDER BY start_time DESC LIMIT 20”””, (pid,)).fetchall()
+con.close(); return rows
 
 init_db()
 
 # ================================================================
-#  NOTIFICATION
-# ================================================================
-def send_zalo(phone, message):
-    if not ZALO_TOKEN or not phone: return False
-    try:
-        r = requests.post("https://openapi.zalo.me/v2.0/oa/message",
-            json={"recipient":{"user_id":phone},"message":{"text":message}},
-            headers={"access_token":ZALO_TOKEN,"Content-Type":"application/json"}, timeout=5)
-        return r.status_code == 200
-    except: return False
 
-def send_sms(phone, message):
-    if not ESMS_API_KEY or not phone: return False
-    try:
-        r = requests.get("http://rest.esms.vn/MainService.svc/json/SendMultipleMessage_V4_get",
-            params={"ApiKey":ESMS_API_KEY,"SecretKey":ESMS_SECRET,"Phone":phone,
-                    "Content":message,"SmsType":2,"Brandname":"SepsisAI"}, timeout=5)
-        return r.status_code == 200
-    except: return False
-
-def notify_all(pname, message, phone=""):
-    def _send():
-        msg = (f"SepsisAI Alert\nBenh nhan: {pname}\n{message}\n"
-               f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
-        target = phone or ZALO_PHONE
-        send_zalo(target, msg)
-        send_sms(target or ESMS_PHONE, msg)
-    threading.Thread(target=_send, daemon=True).start()
+# NOTIFICATION
 
 # ================================================================
-#  SUSTAINED ALERT ENGINE
+
+def send_telegram(message: str) -> bool:
+“”“Gui tin nhan qua Telegram Bot.”””
+if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+print(“Telegram chua cau hinh”); return False
+try:
+r = requests.post(
+f”https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage”,
+json={
+“chat_id”:    TELEGRAM_CHAT_ID,
+“text”:       message,
+“parse_mode”: “HTML”
+}, timeout=5)
+ok = r.status_code == 200
+print(f”Telegram: {‘OK’ if ok else r.text[:60]}”)
+return ok
+except Exception as e:
+print(f”Telegram error: {e}”); return False
+
+def send_sms(phone: str, message: str) -> bool:
+“”“Gui SMS qua SpeedSMS API.”””
+if not SPEEDSMS_TOKEN or not phone:
+print(“SpeedSMS chua cau hinh”); return False
+try:
+credentials = base64.b64encode(
+f”{SPEEDSMS_TOKEN}:0”.encode()
+).decode()
+r = requests.post(
+“https://api.speedsms.vn/index.php/sms/send”,
+json={
+“to”:       [phone],
+“content”:  message,
+“sms_type”: 2,
+“sender”:   SPEEDSMS_SENDER
+},
+headers={
+“Authorization”: f”Basic {credentials}”,
+“Content-Type”:  “application/json”
+}, timeout=5)
+result = r.json()
+ok = result.get(“status”) == “success”
+print(f”SpeedSMS: {‘OK’ if ok else result}”)
+return ok
+except Exception as e:
+print(f”SpeedSMS error: {e}”); return False
+
+def send_email(subject: str, body: str) -> bool:
+“”“Gui email qua Gmail.”””
+if not GMAIL_USER or not GMAIL_PASS or not GMAIL_TO:
+print(“Gmail chua cau hinh”); return False
+try:
+msg            = MIMEText(body, “plain”, “utf-8”)
+msg[“Subject”] = subject
+msg[“From”]    = GMAIL_USER
+msg[“To”]      = GMAIL_TO
+with smtplib.SMTP_SSL(“smtp.gmail.com”, 465) as s:
+s.login(GMAIL_USER, GMAIL_PASS)
+s.send_message(msg)
+print(“Gmail: OK”); return True
+except Exception as e:
+print(f”Gmail error: {e}”); return False
+
+def notify_all(pname: str, message: str, phone: str = “”):
+“”“Gui thong bao qua tat ca kenh trong thread rieng.”””
+def _send():
+full_msg = (
+f”SepsisAI Alert\n”
+f”Benh nhan: {pname}\n”
+f”{message}\n”
+f”Thoi gian: {datetime.now().strftime(’%H:%M %d/%m/%Y’)}”
+)
+tele_msg = (
+f”<b>SepsisAI Alert</b>\n”
+f”Benh nhan: <b>{pname}</b>\n”
+f”{message}\n”
+f”Thoi gian: {datetime.now().strftime(’%H:%M %d/%m/%Y’)}”
+)
+# Telegram (nhanh nhat)
+send_telegram(tele_msg)
+# SpeedSMS
+target = phone or SPEEDSMS_PHONE
+if target:
+send_sms(target, full_msg)
+# Gmail
+send_email(f”SepsisAI Alert - {pname}”, full_msg)
+
+```
+threading.Thread(target=_send, daemon=True).start()
+```
+
 # ================================================================
+
+# SUSTAINED ALERT ENGINE
+
+# ================================================================
+
 class SustainedAlert:
-    def __init__(self, confirm_sec=CONFIRM_SEC):
-        self.confirm_sec = confirm_sec
-        self._timers = {}; self._last_alert = {}
+def **init**(self, confirm_sec=CONFIRM_SEC):
+self.confirm_sec = confirm_sec
+self._timers = {}; self._last_alert = {}
 
-    def check(self, name, condition):
-        now = time.time()
-        if condition:
-            if name not in self._timers: self._timers[name] = now
-            if (now-self._timers[name] >= self.confirm_sec and
-                    now-self._last_alert.get(name,0) >= ALERT_COOLDOWN):
-                self._last_alert[name] = now; return True
-        else:
-            self._timers.pop(name, None)
-        return False
+```
+def check(self, name, condition):
+    now = time.time()
+    if condition:
+        if name not in self._timers: self._timers[name] = now
+        if (now - self._timers[name] >= self.confirm_sec and
+                now - self._last_alert.get(name, 0) >= ALERT_COOLDOWN):
+            self._last_alert[name] = now; return True
+    else:
+        self._timers.pop(name, None)
+    return False
 
-    def elapsed(self, name):
-        return time.time()-self._timers[name] if name in self._timers else 0.0
+def elapsed(self, name):
+    return time.time() - self._timers[name] if name in self._timers else 0.0
 
-    def reset_all(self):
-        self._timers.clear(); self._last_alert.clear()
+def reset_all(self):
+    self._timers.clear(); self._last_alert.clear()
+```
 
 alert_engine = SustainedAlert()
 
 # ================================================================
-#  PERSONALIZED BASELINE
+
+# PERSONALIZED BASELINE
+
 # ================================================================
+
 class PersonalizedBaseline:
-    CALIBRATION_N = 60
-    def __init__(self):
-        self._buf = {"hr":[],"spo2":[],"temp":[],"pi":[]}
-        self.baseline = {"hr":70,"spo2":98,"temp":36.6,"pi":5.0}
-        self.calibrated = False; self.n = 0
+CALIBRATION_N = 60
+def **init**(self):
+self._buf = {“hr”:[],“spo2”:[],“temp”:[],“pi”:[]}
+self.baseline = {“hr”:70,“spo2”:98,“temp”:36.6,“pi”:5.0}
+self.calibrated = False; self.n = 0
 
-    def update(self, hr, spo2, temp, pi):
-        if self.calibrated: return
-        for k,v in zip(["hr","spo2","temp","pi"],[hr,spo2,temp,pi]):
-            self._buf[k].append(v)
-        self.n += 1
-        if self.n >= self.CALIBRATION_N:
-            self.baseline   = {k:float(np.median(v)) for k,v in self._buf.items()}
-            self.calibrated = True
+```
+def update(self, hr, spo2, temp, pi):
+    if self.calibrated: return
+    for k,v in zip(["hr","spo2","temp","pi"],[hr,spo2,temp,pi]):
+        self._buf[k].append(v)
+    self.n += 1
+    if self.n >= self.CALIBRATION_N:
+        self.baseline   = {k:float(np.median(v)) for k,v in self._buf.items()}
+        self.calibrated = True
 
-    def reset(self): self.__init__()
+def reset(self): self.__init__()
 
-    @property
-    def status(self):
-        return "Calibrated" if self.calibrated else f"Calibrating {self.n}/{self.CALIBRATION_N}"
+@property
+def status(self):
+    return "Calibrated" if self.calibrated else f"Calibrating {self.n}/{self.CALIBRATION_N}"
+```
 
 baseline_engine = PersonalizedBaseline()
 
 # ================================================================
-#  FEATURE ENGINEERING
-# ================================================================
-def extract_features(ppg, hr, spo2, temp, baseline):
-    sig = np.array(ppg, dtype=float)
-    dc  = np.mean(sig) + 1e-6
-    pi  = np.std(sig) / dc * 100
-    pv  = np.std(np.diff(sig))
-    peaks, _ = find_peaks(sig, distance=int(SAMPLE_RATE*0.4))
-    ptt = np.mean(np.diff(peaks))/SAMPLE_RATE if len(peaks)>=2 else 0.0
-    return np.array([
-        hr/200, spo2/100, (temp-35)/5, pi/20, pv/1000, ptt,
-        float(skew(sig))/3, float(kurtosis(sig))/10,
-        float(np.max(sig)-np.min(sig))/50000,
-        max(0,98-spo2)/20, hr/(spo2*0.8+1e-6)/2,
-        (hr-baseline.get("hr",70))/50,
-        (spo2-baseline.get("spo2",98))/10,
-        (temp-baseline.get("temp",36.6))/3,
-        (pi-baseline.get("pi",5))/10
-    ], dtype=np.float32)
+
+# FEATURE ENGINEERING
 
 # ================================================================
-#  AI PREDICT
+
+def extract_features(ppg, hr, spo2, temp, baseline):
+sig = np.array(ppg, dtype=float)
+dc  = np.mean(sig) + 1e-6
+pi  = np.std(sig) / dc * 100
+pv  = np.std(np.diff(sig))
+peaks, _ = find_peaks(sig, distance=int(SAMPLE_RATE*0.4))
+ptt = np.mean(np.diff(peaks))/SAMPLE_RATE if len(peaks)>=2 else 0.0
+return np.array([
+hr/200, spo2/100, (temp-35)/5, pi/20, pv/1000, ptt,
+float(skew(sig))/3, float(kurtosis(sig))/10,
+float(np.max(sig)-np.min(sig))/50000,
+max(0,98-spo2)/20, hr/(spo2*0.8+1e-6)/2,
+(hr-baseline.get(“hr”,70))/50,
+(spo2-baseline.get(“spo2”,98))/10,
+(temp-baseline.get(“temp”,36.6))/3,
+(pi-baseline.get(“pi”,5))/10
+], dtype=np.float32)
+
 # ================================================================
+
+# AI PREDICT
+
+# ================================================================
+
 ppg_buffer = deque(maxlen=WINDOW)
 ai_history = deque(maxlen=5)
 
 def hybrid_predict(ppg, hr, spo2, temp):
-    ppg_buffer.append(ppg)
-    if len(ppg_buffer) < WINDOW: return "COLLECTING", 0
-    sig      = np.array(ppg_buffer, dtype=np.float32)
-    pi       = np.std(sig)/(np.mean(sig)+1e-6)*100
-    baseline_engine.update(hr, spo2, temp, pi)
-    features = extract_features(sig, hr, spo2, temp, baseline_engine.baseline)
-    ppg_norm = (sig-np.mean(sig))/(np.std(sig)+1e-6)
-    ppg_in   = ppg_norm.reshape(1, WINDOW, 1)
-    try:
-        dl_pred = dl_model.predict(
-            [ppg_in, features.reshape(1,-1)]
-            if dl_model and len(dl_model.inputs)==2 else ppg_in, verbose=0)
-        dl_risk = float(dl_pred[0][1]) if dl_model else 0.5
-    except: dl_risk = 0.5
-    try:
-        xgb_risk = float(xgb_model.predict_proba(
-            features.reshape(1,-1))[0][1]) if xgb_model else dl_risk
-    except: xgb_risk = dl_risk
-    risk  = 0.6*dl_risk + 0.4*xgb_risk
-    label = "RISK" if risk > 0.5 else "NORMAL"
-    ai_history.append(label)
-    label = "RISK" if ai_history.count("RISK") >= 4 else "NORMAL"
-    return label, int(risk*100)
+ppg_buffer.append(ppg)
+if len(ppg_buffer) < WINDOW: return “COLLECTING”, 0
+sig      = np.array(ppg_buffer, dtype=np.float32)
+pi       = np.std(sig)/(np.mean(sig)+1e-6)*100
+baseline_engine.update(hr, spo2, temp, pi)
+features = extract_features(sig, hr, spo2, temp, baseline_engine.baseline)
+ppg_norm = (sig-np.mean(sig))/(np.std(sig)+1e-6)
+ppg_in   = ppg_norm.reshape(1, WINDOW, 1)
+try:
+dl_pred = dl_model.predict(
+[ppg_in, features.reshape(1,-1)]
+if dl_model and len(dl_model.inputs)==2 else ppg_in, verbose=0)
+dl_risk = float(dl_pred[0][1]) if dl_model else 0.5
+except: dl_risk = 0.5
+try:
+xgb_risk = float(xgb_model.predict_proba(
+features.reshape(1,-1))[0][1]) if xgb_model else dl_risk
+except: xgb_risk = dl_risk
+risk  = 0.6*dl_risk + 0.4*xgb_risk
+label = “RISK” if risk > 0.5 else “NORMAL”
+ai_history.append(label)
+label = “RISK” if ai_history.count(“RISK”) >= 4 else “NORMAL”
+return label, int(risk*100)
 
 # ================================================================
-#  AUTO SAVE
+
+# AUTO SAVE
+
 # ================================================================
+
 current_csv = current_writer = session_start = None
 history = []
 
 def start_session(pname, pid):
-    global current_csv, current_writer, session_start, history
-    history = []; session_start = datetime.now()
-    safe   = "".join(c for c in pname if c.isalnum() or c in " _-")
-    folder = DATA_DIR / f"P{pid:04d}_{safe}"
-    folder.mkdir(exist_ok=True)
-    fname  = folder / f"{session_start.strftime('%Y%m%d_%H%M%S')}.csv"
-    current_csv    = open(fname, "w", newline="", encoding="utf-8-sig")
-    current_writer = csv.writer(current_csv)
-    current_writer.writerow(["Time","HR","SpO2","Temp","PPG","PI","AI_Label","Confidence"])
+global current_csv, current_writer, session_start, history
+history = []; session_start = datetime.now()
+safe   = “”.join(c for c in pname if c.isalnum() or c in “ *-”)
+folder = DATA_DIR / f”P{pid:04d}*{safe}”
+folder.mkdir(exist_ok=True)
+fname  = folder / f”{session_start.strftime(’%Y%m%d_%H%M%S’)}.csv”
+current_csv    = open(fname, “w”, newline=””, encoding=“utf-8-sig”)
+current_writer = csv.writer(current_csv)
+current_writer.writerow([“Time”,“HR”,“SpO2”,“Temp”,“PPG”,“PI”,“AI_Label”,“Confidence”])
 
 def write_row(hr, spo2, temp, ppg, pi, label, conf):
-    if current_writer:
-        current_writer.writerow([datetime.now().strftime("%H:%M:%S"),
-            hr, spo2, f"{temp:.1f}", ppg, f"{pi:.2f}", label, conf])
-        current_csv.flush()
+if current_writer:
+current_writer.writerow([datetime.now().strftime(”%H:%M:%S”),
+hr, spo2, f”{temp:.1f}”, ppg, f”{pi:.2f}”, label, conf])
+current_csv.flush()
 
 def end_session(pid):
-    global current_csv, current_writer
-    if current_csv: current_csv.close()
-    current_csv = current_writer = None
-    if history and session_start:
-        hrs   = [h[1] for h in history]
-        spo2s = [h[2] for h in history]
-        temps = [h[3] for h in history]
-        risks = [h for h in history if h[4]=="RISK"]
-        rr    = len(risks)/len(history)*100 if history else 0
-        save_session(pid,
-            session_start.strftime("%Y-%m-%d %H:%M:%S"),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            float(np.mean(hrs)), float(np.mean(spo2s)),
-            float(np.mean(temps)), rr,
-            "HIGH RISK" if rr>30 else "LOW RISK")
+global current_csv, current_writer
+if current_csv: current_csv.close()
+current_csv = current_writer = None
+if history and session_start:
+hrs   = [h[1] for h in history]
+spo2s = [h[2] for h in history]
+temps = [h[3] for h in history]
+risks = [h for h in history if h[4]==“RISK”]
+rr    = len(risks)/len(history)*100 if history else 0
+save_session(pid,
+session_start.strftime(”%Y-%m-%d %H:%M:%S”),
+datetime.now().strftime(”%Y-%m-%d %H:%M:%S”),
+float(np.mean(hrs)), float(np.mean(spo2s)),
+float(np.mean(temps)), rr,
+“HIGH RISK” if rr>30 else “LOW RISK”)
 
 # ================================================================
-#  GLOBALS
+
+# GLOBALS
+
 # ================================================================
+
 current_patient = None
 ppg_plot        = np.zeros(200)
 ser = running   = None
 last_temp       = 36.5
 
 # ================================================================
-#  GUI
+
+# GUI
+
 # ================================================================
+
 root = tk.Tk()
-root.title("SepsisAI Monitor — Professional")
-root.geometry("1200x860")
-root.configure(bg="#080c14")
+root.title(“SepsisAI Monitor — Professional”)
+root.geometry(“1200x880”)
+root.configure(bg=”#080c14”)
 
-BG=  "#080c14"; BG2= "#0f1624"; CARD="#131d2e"
-ACC= "#00e5ff"; ACC2="#ff4d6d"; GREEN="#00ff9f"
-WARN="#ffb703"; TEXT="#e0e8f0"; GRAY="#4a5568"
+BG=  “#080c14”; BG2= “#0f1624”; CARD=”#131d2e”
+ACC= “#00e5ff”; ACC2=”#ff4d6d”; GREEN=”#00ff9f”
+WARN=”#ffb703”; TEXT=”#e0e8f0”; GRAY=”#4a5568”
 
-style = ttk.Style(); style.theme_use("clam")
-for w in ["TLabel","TFrame","TLabelframe","TLabelframe.Label","TCombobox","TEntry"]:
-    style.configure(w, background=BG, foreground=TEXT)
-style.configure("TButton", background=CARD, foreground=ACC, font=("Consolas",9,"bold"))
+style = ttk.Style(); style.theme_use(“clam”)
+for w in [“TLabel”,“TFrame”,“TLabelframe”,“TLabelframe.Label”,“TCombobox”,“TEntry”]:
+style.configure(w, background=BG, foreground=TEXT)
+style.configure(“TButton”, background=CARD, foreground=ACC, font=(“Consolas”,9,“bold”))
 
-hdr = tk.Frame(root, bg=BG, pady=6); hdr.pack(fill="x")
-tk.Label(hdr, text="AI SepsisAI Monitor",
-         font=("Consolas",18,"bold"), bg=BG, fg=ACC).pack(side="left", padx=16)
-patient_label = tk.Label(hdr, text="[ Chua chon benh nhan ]",
-                          font=("Consolas",11), bg=BG, fg=WARN)
-patient_label.pack(side="left", padx=10)
-status_var = tk.StringVar(value="OFFLINE")
+# Header
+
+hdr = tk.Frame(root, bg=BG, pady=6); hdr.pack(fill=“x”)
+tk.Label(hdr, text=“SepsisAI Monitor”,
+font=(“Consolas”,18,“bold”), bg=BG, fg=ACC).pack(side=“left”, padx=16)
+patient_label = tk.Label(hdr, text=”[ Chua chon benh nhan ]”,
+font=(“Consolas”,11), bg=BG, fg=WARN)
+patient_label.pack(side=“left”, padx=10)
+status_var = tk.StringVar(value=“OFFLINE”)
 tk.Label(hdr, textvariable=status_var,
-         font=("Consolas",10,"bold"), bg=BG, fg=ACC2).pack(side="right", padx=16)
+font=(“Consolas”,10,“bold”), bg=BG, fg=ACC2).pack(side=“right”, padx=16)
 
-notebook     = ttk.Notebook(root); notebook.pack(fill="both", expand=True, padx=8, pady=4)
+# Tabs
+
+notebook     = ttk.Notebook(root); notebook.pack(fill=“both”, expand=True, padx=8, pady=4)
 tab_monitor  = tk.Frame(notebook, bg=BG)
 tab_patients = tk.Frame(notebook, bg=BG)
 tab_history  = tk.Frame(notebook, bg=BG)
 tab_settings = tk.Frame(notebook, bg=BG)
-notebook.add(tab_monitor,  text="  Monitor  ")
-notebook.add(tab_patients, text="  Benh Nhan  ")
-notebook.add(tab_history,  text="  Lich Su  ")
-notebook.add(tab_settings, text="  Cai Dat  ")
+notebook.add(tab_monitor,  text=”  Monitor  “)
+notebook.add(tab_patients, text=”  Benh Nhan  “)
+notebook.add(tab_history,  text=”  Lich Su  “)
+notebook.add(tab_settings, text=”  Cai Dat  “)
 
-# TAB MONITOR
-ctrl = tk.Frame(tab_monitor, bg=BG); ctrl.pack(fill="x", padx=10, pady=6)
+# ── TAB MONITOR ──────────────────────────────────────────────
+
+ctrl = tk.Frame(tab_monitor, bg=BG); ctrl.pack(fill=“x”, padx=10, pady=6)
 port_var = tk.StringVar()
 def list_ports(): return [p.device for p in serial.tools.list_ports.comports()]
-ttk.Combobox(ctrl, values=list_ports(), textvariable=port_var, width=10).pack(side="left", padx=4)
-ttk.Button(ctrl, text="Refresh", command=lambda: None).pack(side="left")
-ttk.Button(ctrl, text="Connect", command=lambda: connect()).pack(side="left", padx=6)
-ttk.Button(ctrl, text="Stop",    command=lambda: disconnect()).pack(side="left")
-baseline_var = tk.StringVar(value="Baseline: -")
-tk.Label(ctrl, textvariable=baseline_var, font=("Consolas",8), bg=BG, fg=GRAY).pack(side="right", padx=10)
+ttk.Combobox(ctrl, values=list_ports(), textvariable=port_var, width=10).pack(side=“left”, padx=4)
+ttk.Button(ctrl, text=“Refresh”,  command=lambda: None).pack(side=“left”)
+ttk.Button(ctrl, text=“Connect”,  command=lambda: connect()).pack(side=“left”, padx=6)
+ttk.Button(ctrl, text=“Stop”,     command=lambda: disconnect()).pack(side=“left”)
+baseline_var = tk.StringVar(value=“Baseline: -”)
+tk.Label(ctrl, textvariable=baseline_var,
+font=(“Consolas”,8), bg=BG, fg=GRAY).pack(side=“right”, padx=10)
 
-cards_frame = tk.Frame(tab_monitor, bg=BG); cards_frame.pack(fill="x", padx=10, pady=4)
+# Vitals cards
+
+cards_frame = tk.Frame(tab_monitor, bg=BG); cards_frame.pack(fill=“x”, padx=10, pady=4)
 
 def make_card(parent, title, var, unit, color):
-    f = tk.Frame(parent, bg=CARD); f.pack(side="left", expand=True, fill="both", padx=4, pady=2)
-    tk.Frame(f, bg=color, height=3).pack(fill="x")
-    tk.Label(f, text=title,  font=("Consolas",9),    bg=CARD, fg=GRAY).pack(pady=(6,0))
-    tk.Label(f, textvariable=var, font=("Consolas",22,"bold"), bg=CARD, fg=color).pack()
-    tk.Label(f, text=unit,   font=("Consolas",9),    bg=CARD, fg=GRAY).pack(pady=(0,6))
+f = tk.Frame(parent, bg=CARD); f.pack(side=“left”, expand=True, fill=“both”, padx=4, pady=2)
+tk.Frame(f, bg=color, height=3).pack(fill=“x”)
+tk.Label(f, text=title, font=(“Consolas”,9),    bg=CARD, fg=GRAY).pack(pady=(6,0))
+tk.Label(f, textvariable=var, font=(“Consolas”,22,“bold”), bg=CARD, fg=color).pack()
+tk.Label(f, text=unit,  font=(“Consolas”,9),    bg=CARD, fg=GRAY).pack(pady=(0,6))
 
-hr_var     = tk.StringVar(value="-")
-spo2_var   = tk.StringVar(value="-")
-temp_var   = tk.StringVar(value="-")
-pi_var     = tk.StringVar(value="-")
-finger_var = tk.StringVar(value="-")
-ai_var     = tk.StringVar(value="WAITING")
-conf_var   = tk.StringVar(value="-")
-timer_var  = tk.StringVar(value="")
+hr_var     = tk.StringVar(value=”-”)
+spo2_var   = tk.StringVar(value=”-”)
+temp_var   = tk.StringVar(value=”-”)
+pi_var     = tk.StringVar(value=”-”)
+finger_var = tk.StringVar(value=”-”)
+ai_var     = tk.StringVar(value=“WAITING”)
+conf_var   = tk.StringVar(value=”-”)
+timer_var  = tk.StringVar(value=””)
 
-make_card(cards_frame, "HEART RATE",  hr_var,     "bpm", ACC)
-make_card(cards_frame, "SpO2",        spo2_var,   "%",   GREEN)
-make_card(cards_frame, "TEMPERATURE", temp_var,   "C",   WARN)
-make_card(cards_frame, "PERF INDEX",  pi_var,     "%",   "#bb86fc")
-make_card(cards_frame, "FINGER",      finger_var, "",    GRAY)
+make_card(cards_frame, “HEART RATE”,  hr_var,     “bpm”, ACC)
+make_card(cards_frame, “SpO2”,        spo2_var,   “%”,   GREEN)
+make_card(cards_frame, “TEMPERATURE”, temp_var,   “C”,   WARN)
+make_card(cards_frame, “PERF INDEX”,  pi_var,     “%”,   “#bb86fc”)
+make_card(cards_frame, “FINGER”,      finger_var, “”,    GRAY)
 
-ai_card = tk.Frame(cards_frame, bg=CARD); ai_card.pack(side="left", expand=True, fill="both", padx=4, pady=2)
-tk.Frame(ai_card, bg=ACC2, height=3).pack(fill="x")
-tk.Label(ai_card, text="AI STATUS", font=("Consolas",9), bg=CARD, fg=GRAY).pack(pady=(6,0))
-ai_label_w = tk.Label(ai_card, textvariable=ai_var, font=("Consolas",13,"bold"), bg=CARD, fg=GREEN)
+ai_card = tk.Frame(cards_frame, bg=CARD)
+ai_card.pack(side=“left”, expand=True, fill=“both”, padx=4, pady=2)
+tk.Frame(ai_card, bg=ACC2, height=3).pack(fill=“x”)
+tk.Label(ai_card, text=“AI STATUS”, font=(“Consolas”,9), bg=CARD, fg=GRAY).pack(pady=(6,0))
+ai_label_w = tk.Label(ai_card, textvariable=ai_var,
+font=(“Consolas”,13,“bold”), bg=CARD, fg=GREEN)
 ai_label_w.pack()
-tk.Label(ai_card, textvariable=conf_var,  font=("Consolas",8),        bg=CARD, fg=GRAY).pack()
-tk.Label(ai_card, textvariable=timer_var, font=("Consolas",8,"bold"), bg=CARD, fg=WARN).pack(pady=(0,6))
+tk.Label(ai_card, textvariable=conf_var,  font=(“Consolas”,8),        bg=CARD, fg=GRAY).pack()
+tk.Label(ai_card, textvariable=timer_var, font=(“Consolas”,8,“bold”), bg=CARD, fg=WARN).pack(pady=(0,6))
 
 tk.Label(tab_monitor,
-         text="Nhiet do tu dong tu cam bien GY-906 | Nhan nut tren ESP32 de do nhiet do",
-         font=("Consolas",8), bg=BG, fg=GRAY).pack(pady=2)
+text=“Nhiet do tu dong tu GY-906 | Nhan nut tren ESP32 de do nhiet do”,
+font=(“Consolas”,8), bg=BG, fg=GRAY).pack(pady=2)
 
-fig = Figure(figsize=(10, 2.6), facecolor=BG2)
+# PPG Plot
+
+fig = Figure(figsize=(10, 2.5), facecolor=BG2)
 ax  = fig.add_subplot(111)
 ax.set_facecolor(BG2)
-ax.set_title("PPG Waveform - Live", color=TEXT, fontsize=9, pad=4)
+ax.set_title(“PPG Waveform - Live”, color=TEXT, fontsize=9, pad=4)
 ax.tick_params(colors=GRAY, labelsize=7)
 for sp in ax.spines.values(): sp.set_edgecolor(CARD)
 line_ppg, = ax.plot(np.arange(200), ppg_plot, color=ACC, linewidth=1.3, alpha=0.9)
 canvas = FigureCanvasTkAgg(fig, tab_monitor)
-canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=4)
+canvas.get_tk_widget().pack(fill=“both”, expand=True, padx=10, pady=4)
+
+# Buttons
 
 mb = tk.Frame(tab_monitor, bg=BG); mb.pack(pady=6)
 def btn(parent, text, cmd, color=ACC):
-    b = tk.Button(parent, text=text, command=cmd, bg=CARD, fg=color,
-                  font=("Consolas",9,"bold"), relief="flat", padx=12, pady=4,
-                  activebackground=BG2, activeforeground=color, cursor="hand2")
-    b.pack(side="left", padx=6); return b
+b = tk.Button(parent, text=text, command=cmd, bg=CARD, fg=color,
+font=(“Consolas”,9,“bold”), relief=“flat”, padx=12, pady=4,
+activebackground=BG2, activeforeground=color, cursor=“hand2”)
+b.pack(side=“left”, padx=6); return b
 
-btn(mb, "Xuat Bao Cao",  lambda: export_report())
-btn(mb, "Reset Baseline", lambda: baseline_engine.reset())
-btn(mb, "Xoa History",   lambda: history.clear())
-btn(mb, "Test Notify",   lambda: test_notify(), WARN)
+btn(mb, “Xuat Bao Cao”,  lambda: export_report())
+btn(mb, “Reset Baseline”, lambda: baseline_engine.reset())
+btn(mb, “Xoa History”,   lambda: history.clear())
+btn(mb, “Test Notify”,   lambda: test_notify(), WARN)
 
-# TAB BENH NHAN
-pf = tk.LabelFrame(tab_patients, text=" Them Benh Nhan Moi ",
-                    bg=BG, fg=ACC, font=("Consolas",10,"bold"), relief="flat")
-pf.pack(fill="x", padx=12, pady=8)
+# ── TAB BENH NHAN ────────────────────────────────────────────
+
+pf = tk.LabelFrame(tab_patients, text=” Them Benh Nhan Moi “,
+bg=BG, fg=ACC, font=(“Consolas”,10,“bold”), relief=“flat”)
+pf.pack(fill=“x”, padx=12, pady=8)
 
 fields_p = {}
-for i,(lbl,key) in enumerate([("Ho ten *","name"),("Ngay sinh","dob"),
-                                ("Gioi tinh","gender"),("SDT/Zalo","phone"),
-                                ("Dia chi","address"),("Ghi chu","note")]):
-    r,c = divmod(i,2)
-    tk.Label(pf, text=lbl, font=("Consolas",9), bg=BG, fg=GRAY).grid(
-        row=r*2, column=c*2, sticky="w", padx=10, pady=2)
-    e = tk.Entry(pf, width=22, font=("Consolas",10),
-                 bg=CARD, fg=TEXT, insertbackground=ACC, relief="flat")
-    e.grid(row=r*2+1, column=c*2, padx=10, pady=2, sticky="w")
-    fields_p[key] = e
+for i,(lbl,key) in enumerate([(“Ho ten *”,“name”),(“Ngay sinh”,“dob”),
+(“Gioi tinh”,“gender”),(“SDT/Zalo”,“phone”),
+(“Dia chi”,“address”),(“Ghi chu”,“note”)]):
+r,c = divmod(i,2)
+tk.Label(pf, text=lbl, font=(“Consolas”,9), bg=BG, fg=GRAY).grid(
+row=r*2, column=c*2, sticky=“w”, padx=10, pady=2)
+e = tk.Entry(pf, width=22, font=(“Consolas”,10),
+bg=CARD, fg=TEXT, insertbackground=ACC, relief=“flat”)
+e.grid(row=r*2+1, column=c*2, padx=10, pady=2, sticky=“w”)
+fields_p[key] = e
 
 def add_patient_gui():
-    name = fields_p["name"].get().strip()
-    if not name: messagebox.showwarning("Loi","Ho ten khong duoc de trong"); return
-    pid = add_patient(name, fields_p["dob"].get(), fields_p["gender"].get(),
-                      fields_p["phone"].get(), fields_p["address"].get(), fields_p["note"].get())
-    for e in fields_p.values(): e.delete(0,"end")
-    refresh_patient_list()
-    messagebox.showinfo("OK", f"Da them: {name} (ID:{pid})")
+name = fields_p[“name”].get().strip()
+if not name: messagebox.showwarning(“Loi”,“Ho ten khong duoc de trong”); return
+pid = add_patient(name, fields_p[“dob”].get(), fields_p[“gender”].get(),
+fields_p[“phone”].get(), fields_p[“address”].get(),
+fields_p[“note”].get())
+for e in fields_p.values(): e.delete(0,“end”)
+refresh_patient_list()
+messagebox.showinfo(“OK”, f”Da them: {name} (ID:{pid})”)
 
-tk.Button(pf, text="Them", command=add_patient_gui,
-          bg=ACC, fg=BG, font=("Consolas",10,"bold"),
-          relief="flat", padx=14, pady=4, cursor="hand2").grid(
-    row=8, column=0, columnspan=4, pady=10)
+tk.Button(pf, text=“Them”, command=add_patient_gui,
+bg=ACC, fg=BG, font=(“Consolas”,10,“bold”),
+relief=“flat”, padx=14, pady=4, cursor=“hand2”).grid(
+row=8, column=0, columnspan=4, pady=10)
 
-pl = tk.LabelFrame(tab_patients, text=" Danh Sach Benh Nhan ",
-                    bg=BG, fg=ACC, font=("Consolas",10,"bold"), relief="flat")
-pl.pack(fill="both", expand=True, padx=12, pady=4)
+pl = tk.LabelFrame(tab_patients, text=” Danh Sach Benh Nhan “,
+bg=BG, fg=ACC, font=(“Consolas”,10,“bold”), relief=“flat”)
+pl.pack(fill=“both”, expand=True, padx=12, pady=4)
 
-pt_cols = ("ID","Ho ten","Ngay sinh","Gioi tinh","SDT")
-pt_tree = ttk.Treeview(pl, columns=pt_cols, show="headings", height=10)
+pt_cols = (“ID”,“Ho ten”,“Ngay sinh”,“Gioi tinh”,“SDT”)
+pt_tree = ttk.Treeview(pl, columns=pt_cols, show=“headings”, height=10)
 for c in pt_cols:
-    pt_tree.heading(c, text=c)
-    pt_tree.column(c, width=200 if c=="Ho ten" else 120)
-pt_tree.pack(fill="both", expand=True, padx=6, pady=6)
+pt_tree.heading(c, text=c)
+pt_tree.column(c, width=200 if c==“Ho ten” else 120)
+pt_tree.pack(fill=“both”, expand=True, padx=6, pady=6)
 
 def refresh_patient_list():
-    for r in pt_tree.get_children(): pt_tree.delete(r)
-    for p in get_patients(): pt_tree.insert("","end",values=p)
+for r in pt_tree.get_children(): pt_tree.delete(r)
+for p in get_patients(): pt_tree.insert(””,“end”,values=p)
 
 refresh_patient_list()
 
 def select_patient():
-    global current_patient
-    sel = pt_tree.selection()
-    if not sel: messagebox.showwarning("","Chon benh nhan truoc"); return
-    vals = pt_tree.item(sel[0])["values"]
-    pid, name, _, _, phone = vals
-    current_patient = (int(pid), str(name), str(phone))
-    patient_label.config(text=f"{name}  |  ID: {pid}")
-    messagebox.showinfo("OK", f"Da chon: {name}")
-    notebook.select(tab_monitor)
+global current_patient
+sel = pt_tree.selection()
+if not sel: messagebox.showwarning(””,“Chon benh nhan truoc”); return
+vals = pt_tree.item(sel[0])[“values”]
+pid, name, _, _, phone = vals
+current_patient = (int(pid), str(name), str(phone))
+patient_label.config(text=f”{name}  |  ID: {pid}”)
+messagebox.showinfo(“OK”, f”Da chon: {name}”)
+notebook.select(tab_monitor)
 
 pb = tk.Frame(tab_patients, bg=BG); pb.pack(pady=6)
-btn(pb, "Chon de Do",  select_patient,       ACC)
-btn(pb, "Refresh",     refresh_patient_list, GRAY)
+btn(pb, “Chon de Do”,  select_patient,       ACC)
+btn(pb, “Refresh”,     refresh_patient_list, GRAY)
 
-# TAB LICH SU
+# ── TAB LICH SU ──────────────────────────────────────────────
+
 hs_frame = tk.Frame(tab_history, bg=BG)
-hs_frame.pack(fill="both", expand=True, padx=12, pady=8)
-tk.Label(hs_frame, text="Chon benh nhan de xem lich su:",
-         font=("Consolas",10), bg=BG, fg=GRAY).pack(anchor="w")
+hs_frame.pack(fill=“both”, expand=True, padx=12, pady=8)
+tk.Label(hs_frame, text=“Chon benh nhan de xem lich su:”,
+font=(“Consolas”,10), bg=BG, fg=GRAY).pack(anchor=“w”)
 hs_pid_var = tk.StringVar()
 hs_combo   = ttk.Combobox(hs_frame, textvariable=hs_pid_var, width=30)
-hs_combo.pack(anchor="w", pady=4)
+hs_combo.pack(anchor=“w”, pady=4)
 
 def refresh_hs_combo():
-    hs_combo["values"] = [f"{p[0]} - {p[1]}" for p in get_patients()]
+hs_combo[“values”] = [f”{p[0]} - {p[1]}” for p in get_patients()]
 
 refresh_hs_combo()
 
-hs_cols = ("Thoi gian","HR TB","SpO2 TB","Temp TB","Risk Rate","Ket luan")
-hs_tree = ttk.Treeview(hs_frame, columns=hs_cols, show="headings", height=14)
+hs_cols = (“Thoi gian”,“HR TB”,“SpO2 TB”,“Temp TB”,“Risk Rate”,“Ket luan”)
+hs_tree = ttk.Treeview(hs_frame, columns=hs_cols, show=“headings”, height=14)
 for c in hs_cols:
-    hs_tree.heading(c, text=c); hs_tree.column(c, width=130)
-hs_tree.pack(fill="both", expand=True, pady=6)
+hs_tree.heading(c, text=c); hs_tree.column(c, width=130)
+hs_tree.pack(fill=“both”, expand=True, pady=6)
 
 def load_history():
-    val = hs_pid_var.get()
-    if not val: return
-    pid = int(val.split("-")[0].strip())
-    for r in hs_tree.get_children(): hs_tree.delete(r)
-    for s in get_sessions(pid):
-        hs_tree.insert("","end", values=(
-            s[0], f"{s[1]:.1f}", f"{s[2]:.1f}",
-            f"{s[3]:.1f}C", f"{s[4]:.1f}%", s[5]))
+val = hs_pid_var.get()
+if not val: return
+pid = int(val.split(”-”)[0].strip())
+for r in hs_tree.get_children(): hs_tree.delete(r)
+for s in get_sessions(pid):
+hs_tree.insert(””,“end”, values=(
+s[0], f”{s[1]:.1f}”, f”{s[2]:.1f}”,
+f”{s[3]:.1f}C”, f”{s[4]:.1f}%”, s[5]))
 
-btn(hs_frame, "Tai Lich Su", load_history, ACC)
+btn(hs_frame, “Tai Lich Su”, load_history, ACC)
 
-# TAB CAI DAT
-sf = tk.Frame(tab_settings, bg=BG); sf.pack(fill="both", expand=True, padx=20, pady=10)
-tk.Label(sf, text="Cai Dat Thong Bao",
-         font=("Consolas",13,"bold"), bg=BG, fg=ACC).pack(anchor="w", pady=8)
+# ── TAB CAI DAT ──────────────────────────────────────────────
+
+sf = tk.Frame(tab_settings, bg=BG)
+sf.pack(fill=“both”, expand=True, padx=20, pady=10)
+
+tk.Label(sf, text=“Cai Dat Thong Bao”,
+font=(“Consolas”,13,“bold”), bg=BG, fg=ACC).pack(anchor=“w”, pady=8)
 
 cfg_fields = {}
-for lbl,key,default in [
-    ("Zalo OA Token","zalo_token",ZALO_TOKEN),
-    ("Zalo Phone","zalo_phone",ZALO_PHONE),
-    ("ESMS API Key","esms_key",ESMS_API_KEY),
-    ("ESMS Secret","esms_secret",ESMS_SECRET),
-    ("ESMS Phone","esms_phone",ESMS_PHONE),
-    ("Confirm Sec","confirm_sec",str(CONFIRM_SEC)),
-]:
-    r = tk.Frame(sf, bg=BG); r.pack(fill="x", pady=3)
-    tk.Label(r, text=f"{lbl}:", width=18, anchor="w",
-             font=("Consolas",9), bg=BG, fg=GRAY).pack(side="left")
-    e = tk.Entry(r, width=40, font=("Consolas",10),
-                 bg=CARD, fg=TEXT, insertbackground=ACC, relief="flat")
-    e.insert(0, default); e.pack(side="left", padx=6)
-    cfg_fields[key] = e
+cfg_cfg = [
+# Telegram
+(“── Telegram ──────”,  None,              None),
+(“Telegram Token”,       “tele_token”,      TELEGRAM_TOKEN),
+(“Telegram Chat ID”,     “tele_chat”,       TELEGRAM_CHAT_ID),
+# SpeedSMS
+(“── SpeedSMS ──────”,  None,              None),
+(“SpeedSMS Token”,       “speed_token”,     SPEEDSMS_TOKEN),
+(“SpeedSMS Phone”,       “speed_phone”,     SPEEDSMS_PHONE),
+(“SpeedSMS Sender”,      “speed_sender”,    SPEEDSMS_SENDER),
+# Gmail
+(“── Gmail ─────────”,  None,              None),
+(“Gmail User”,           “gmail_user”,      GMAIL_USER),
+(“Gmail App Password”,   “gmail_pass”,      GMAIL_PASS),
+(“Gmail To”,             “gmail_to”,        GMAIL_TO),
+# General
+(“── General ───────”,  None,              None),
+(“Confirm Sec”,          “confirm_sec”,     str(CONFIRM_SEC)),
+]
+
+for lbl, key, default in cfg_cfg:
+if key is None:
+# Section header
+tk.Label(sf, text=lbl, font=(“Consolas”,8,“bold”),
+bg=BG, fg=ACC).pack(anchor=“w”, pady=(8,2))
+continue
+r = tk.Frame(sf, bg=BG); r.pack(fill=“x”, pady=2)
+tk.Label(r, text=f”{lbl}:”, width=22, anchor=“w”,
+font=(“Consolas”,9), bg=BG, fg=GRAY).pack(side=“left”)
+e = tk.Entry(r, width=38, font=(“Consolas”,10),
+bg=CARD, fg=TEXT, insertbackground=ACC, relief=“flat”,
+show=”*” if “pass” in key.lower() or “token” in key.lower() else “”)
+e.insert(0, default or “”); e.pack(side=“left”, padx=6)
+cfg_fields[key] = e
 
 def save_settings():
-    global ZALO_TOKEN, ZALO_PHONE, ESMS_API_KEY, ESMS_SECRET, ESMS_PHONE, CONFIRM_SEC
-    ZALO_TOKEN   = cfg_fields["zalo_token"].get()
-    ZALO_PHONE   = cfg_fields["zalo_phone"].get()
-    ESMS_API_KEY = cfg_fields["esms_key"].get()
-    ESMS_SECRET  = cfg_fields["esms_secret"].get()
-    ESMS_PHONE   = cfg_fields["esms_phone"].get()
-    try:
-        CONFIRM_SEC = int(cfg_fields["confirm_sec"].get())
-        alert_engine.confirm_sec = CONFIRM_SEC
-    except: pass
-    messagebox.showinfo("OK","Da luu cai dat")
+global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+global SPEEDSMS_TOKEN, SPEEDSMS_PHONE, SPEEDSMS_SENDER
+global GMAIL_USER, GMAIL_PASS, GMAIL_TO, CONFIRM_SEC
 
-btn(sf, "Luu Cai Dat", save_settings, ACC)
+```
+TELEGRAM_TOKEN   = cfg_fields["tele_token"].get()
+TELEGRAM_CHAT_ID = cfg_fields["tele_chat"].get()
+SPEEDSMS_TOKEN   = cfg_fields["speed_token"].get()
+SPEEDSMS_PHONE   = cfg_fields["speed_phone"].get()
+SPEEDSMS_SENDER  = cfg_fields["speed_sender"].get()
+GMAIL_USER       = cfg_fields["gmail_user"].get()
+GMAIL_PASS       = cfg_fields["gmail_pass"].get()
+GMAIL_TO         = cfg_fields["gmail_to"].get()
+try:
+    CONFIRM_SEC = int(cfg_fields["confirm_sec"].get())
+    alert_engine.confirm_sec = CONFIRM_SEC
+except: pass
+messagebox.showinfo("OK", "Da luu cai dat!")
+```
+
+btn_sf = tk.Frame(sf, bg=BG); btn_sf.pack(pady=8)
+btn(btn_sf, “Luu Cai Dat”,  save_settings,         ACC)
+btn(btn_sf, “Test Telegram”, lambda: threading.Thread(
+target=lambda: send_telegram(“Test tu SepsisAI”), daemon=True).start(), WARN)
+btn(btn_sf, “Test SMS”,      lambda: threading.Thread(
+target=lambda: send_sms(SPEEDSMS_PHONE, “Test SMS tu SepsisAI”), daemon=True).start(), WARN)
+btn(btn_sf, “Test Gmail”,    lambda: threading.Thread(
+target=lambda: send_email(“SepsisAI Test”, “Test email tu SepsisAI”), daemon=True).start(), WARN)
+
+tk.Label(sf,
+text=(
+“Telegram: Tao bot tai @BotFather tren Telegram\n”
+“SpeedSMS: Dang ky tai speedsms.vn - lay Access Token\n”
+“Gmail   : Bat 2FA > App Password > Tao mat khau 16 ky tu”
+),
+font=(“Consolas”,8), bg=BG, fg=GRAY, justify=“left”).pack(anchor=“w”, pady=8)
 
 # ================================================================
-#  PLOT UPDATE
+
+# PLOT UPDATE
+
 # ================================================================
+
 def _update_plot(ppg_val):
-    global ppg_plot
-    ppg_plot     = np.roll(ppg_plot, -1)
-    ppg_plot[-1] = float(ppg_val)
-    line_ppg.set_ydata(ppg_plot)
-    valid = ppg_plot[ppg_plot > 0]
-    if len(valid) > 10:
-        lo,hi = valid.min(), valid.max()
-        ax.set_ylim(lo-(hi-lo)*0.15-1, hi+(hi-lo)*0.15+1)
-    canvas.draw_idle()
+global ppg_plot
+ppg_plot     = np.roll(ppg_plot, -1)
+ppg_plot[-1] = float(ppg_val)
+line_ppg.set_ydata(ppg_plot)
+valid = ppg_plot[ppg_plot > 0]
+if len(valid) > 10:
+lo,hi = valid.min(), valid.max()
+ax.set_ylim(lo-(hi-lo)*0.15-1, hi+(hi-lo)*0.15+1)
+canvas.draw_idle()
 
 # ================================================================
-#  GUI UPDATE + ALERT
+
+# GUI UPDATE + ALERT
+
 # ================================================================
+
 def update_gui(finger, hr, spo2, ppg, label, conf, temp):
-    baseline_var.set(f"Baseline: {baseline_engine.status}")
+baseline_var.set(f”Baseline: {baseline_engine.status}”)
 
-    if not finger:
-        finger_var.set("NO"); ai_var.set("NO FINGER")
-        ai_label_w.config(fg=GRAY); timer_var.set("")
-        alert_engine.reset_all(); return
+```
+if not finger:
+    finger_var.set("NO"); ai_var.set("NO FINGER")
+    ai_label_w.config(fg=GRAY); timer_var.set("")
+    alert_engine.reset_all(); return
 
-    sig = np.array(ppg_buffer) if len(ppg_buffer)==WINDOW else np.zeros(WINDOW)
-    pi  = np.std(sig)/(np.mean(sig)+1e-6)*100
+sig = np.array(ppg_buffer) if len(ppg_buffer)==WINDOW else np.zeros(WINDOW)
+pi  = np.std(sig)/(np.mean(sig)+1e-6)*100
 
-    finger_var.set("YES")
-    hr_var.set(f"{hr:.0f}")
-    spo2_var.set(f"{spo2:.1f}")
-    pi_var.set(f"{pi:.2f}")
-    conf_var.set(f"Confidence: {conf}%")
+finger_var.set("YES")
+hr_var.set(f"{hr:.0f}")
+spo2_var.set(f"{spo2:.1f}")
+pi_var.set(f"{pi:.2f}")
+conf_var.set(f"Confidence: {conf}%")
+if temp > 25.0 and temp < 45.0:
+    temp_var.set(f"{temp:.1f}")
 
-    # Cap nhat nhiet do tu GY-906
-    if temp > 25.0 and temp < 45.0:
-        temp_var.set(f"{temp:.1f}")
+pname  = current_patient[1] if current_patient else "Unknown"
+pphone = current_patient[2] if current_patient else ""
+alert_msg = None
 
-    pname  = current_patient[1] if current_patient else "Unknown"
-    pphone = current_patient[2] if current_patient else ""
-    alert_msg = None
+if alert_engine.check("spo2_crit", spo2>0 and spo2<90):
+    ai_var.set("CRITICAL SpO2"); ai_label_w.config(fg=ACC2)
+    alert_msg = f"SpO2 nguy hiem: {spo2:.1f}%"
+elif alert_engine.check("sepsis", temp>=38.3 and hr>100):
+    ai_var.set("SEPSIS RISK"); ai_label_w.config(fg=ACC2)
+    alert_msg = f"Nghi ngo Sepsis! Temp:{temp:.1f}C HR:{hr:.0f}bpm"
+elif alert_engine.check("tachy", hr>130):
+    ai_var.set("TACHYCARDIA"); ai_label_w.config(fg=WARN)
+    alert_msg = f"Nhip tim nhanh: {hr:.0f} bpm"
+elif alert_engine.check("brady", 0<hr<50):
+    ai_var.set("BRADYCARDIA"); ai_label_w.config(fg=WARN)
+    alert_msg = f"Nhip tim cham: {hr:.0f} bpm"
+elif alert_engine.check("hypo_temp", 0<temp<=35.0):
+    ai_var.set("HYPOTHERMIA"); ai_label_w.config(fg=WARN)
+    alert_msg = f"Ha than nhiet: {temp:.1f}C"
+elif alert_engine.check("fever", temp>=38.3):
+    ai_var.set("FEVER"); ai_label_w.config(fg=WARN)
+    alert_msg = f"Sot: {temp:.1f}C"
+elif alert_engine.check("spo2_low", spo2>0 and spo2<94):
+    ai_var.set("SpO2 LOW"); ai_label_w.config(fg=WARN)
+    alert_msg = f"SpO2 thap: {spo2:.1f}%"
+elif alert_engine.check("ai_risk", label=="RISK" and conf>60):
+    ai_var.set(f"HIGH RISK {conf}%"); ai_label_w.config(fg=ACC2)
+    alert_msg = f"AI nguy co cao ({conf}%)"
+else:
+    if label=="RISK": ai_var.set(f"MOD RISK {conf}%"); ai_label_w.config(fg=WARN)
+    else:             ai_var.set(f"NORMAL {conf}%");   ai_label_w.config(fg=GREEN)
 
-    if alert_engine.check("spo2_crit", spo2>0 and spo2<90):
-        ai_var.set("CRITICAL SpO2"); ai_label_w.config(fg=ACC2)
-        alert_msg = f"SpO2 nguy hiem: {spo2:.1f}%"
-    elif alert_engine.check("sepsis", temp>=38.3 and hr>100):
-        ai_var.set("SEPSIS RISK"); ai_label_w.config(fg=ACC2)
-        alert_msg = f"Nghi ngo Sepsis! Temp:{temp:.1f}C HR:{hr:.0f}bpm"
-    elif alert_engine.check("tachy", hr>130):
-        ai_var.set("TACHYCARDIA"); ai_label_w.config(fg=WARN)
-        alert_msg = f"Nhip tim nhanh: {hr:.0f} bpm"
-    elif alert_engine.check("brady", 0<hr<50):
-        ai_var.set("BRADYCARDIA"); ai_label_w.config(fg=WARN)
-        alert_msg = f"Nhip tim cham: {hr:.0f} bpm"
-    elif alert_engine.check("hypo_temp", temp>0 and temp<=35.0):
-        ai_var.set("HYPOTHERMIA"); ai_label_w.config(fg=WARN)
-        alert_msg = f"Ha than nhiet: {temp:.1f}C"
-    elif alert_engine.check("fever", temp>=38.3):
-        ai_var.set("FEVER"); ai_label_w.config(fg=WARN)
-        alert_msg = f"Sot: {temp:.1f}C"
-    elif alert_engine.check("spo2_low", spo2>0 and spo2<94):
-        ai_var.set("SpO2 LOW"); ai_label_w.config(fg=WARN)
-        alert_msg = f"SpO2 thap: {spo2:.1f}%"
-    elif alert_engine.check("ai_risk", label=="RISK" and conf>60):
-        ai_var.set(f"HIGH RISK {conf}%"); ai_label_w.config(fg=ACC2)
-        alert_msg = f"AI nguy co cao ({conf}%)"
-    else:
-        if label=="RISK": ai_var.set(f"MOD RISK {conf}%"); ai_label_w.config(fg=WARN)
-        else:             ai_var.set(f"NORMAL {conf}%");   ai_label_w.config(fg=GREEN)
+conds = {"spo2_crit":"SpO2 CRIT","sepsis":"Sepsis","tachy":"HR UP",
+         "brady":"HR DOWN","hypo_temp":"Temp LOW","fever":"Fever",
+         "spo2_low":"SpO2 LOW","ai_risk":"AI RISK"}
+active = [f"{v} {alert_engine.elapsed(k):.0f}s"
+          for k,v in conds.items() if alert_engine.elapsed(k)>0]
+timer_var.set("  ".join(active))
 
-    conds = {"spo2_crit":"SpO2 CRIT","sepsis":"Sepsis","tachy":"HR UP",
-             "brady":"HR DOWN","hypo_temp":"Temp LOW","fever":"Fever",
-             "spo2_low":"SpO2 LOW","ai_risk":"AI RISK"}
-    active = [f"{v} {alert_engine.elapsed(k):.0f}s"
-              for k,v in conds.items() if alert_engine.elapsed(k)>0]
-    timer_var.set("  ".join(active))
-
-    if alert_msg:
-        root.after(0, lambda m=alert_msg, n=pname, p=pphone: _do_alert(m,n,p))
+if alert_msg:
+    root.after(0, lambda m=alert_msg, n=pname, p=pphone: _do_alert(m,n,p))
+```
 
 def _do_alert(msg, pname, phone):
-    try: winsound.Beep(1000, 600)
-    except: pass
-    messagebox.showwarning("ALERT", f"Benh nhan: {pname}\n{msg}")
-    notify_all(pname, msg, phone)
+try: winsound.Beep(1000, 600)
+except: pass
+messagebox.showwarning(“ALERT”, f”Benh nhan: {pname}\n{msg}”)
+notify_all(pname, msg, phone)
 
 def test_notify():
-    if not current_patient:
-        messagebox.showwarning("","Chon benh nhan truoc"); return
-    notify_all(current_patient[1], "Test tu SepsisAI Monitor.", current_patient[2])
-    messagebox.showinfo("OK","Da gui thong bao test")
+if not current_patient:
+messagebox.showwarning(””,“Chon benh nhan truoc”); return
+notify_all(current_patient[1], “Day la tin nhan test tu SepsisAI.”, current_patient[2])
+messagebox.showinfo(“OK”,“Da gui thong bao test”)
 
 # ================================================================
-#  SERIAL
+
+# SERIAL
+
 # ================================================================
+
 def connect():
-    global ser, running
-    if not current_patient:
-        if not messagebox.askyesno("Chua chon benh nhan",
-                                    "Tiep tuc do ma khong luu ho so?"): return
-    try:
-        ser     = serial.Serial(port_var.get(), BAUDRATE, timeout=1)
-        running = True
-        status_var.set("LIVE")
-        baseline_engine.reset(); alert_engine.reset_all()
-        if current_patient: start_session(current_patient[1], current_patient[0])
-        threading.Thread(target=read_serial, daemon=True).start()
-    except Exception as e:
-        messagebox.showerror("Loi ket noi", str(e))
+global ser, running
+if not current_patient:
+if not messagebox.askyesno(“Chua chon benh nhan”,
+“Tiep tuc do ma khong luu ho so?”): return
+try:
+ser     = serial.Serial(port_var.get(), BAUDRATE, timeout=1)
+running = True
+status_var.set(“LIVE”)
+baseline_engine.reset(); alert_engine.reset_all()
+if current_patient: start_session(current_patient[1], current_patient[0])
+threading.Thread(target=read_serial, daemon=True).start()
+except Exception as e:
+messagebox.showerror(“Loi ket noi”, str(e))
 
 def disconnect():
-    global ser, running
-    running = False
-    if ser and ser.is_open: ser.close()
-    status_var.set("OFFLINE")
-    ppg_buffer.clear(); ai_history.clear()
-    baseline_engine.reset(); alert_engine.reset_all()
-    if current_patient: end_session(current_patient[0]); refresh_hs_combo()
+global ser, running
+running = False
+if ser and ser.is_open: ser.close()
+status_var.set(“OFFLINE”)
+ppg_buffer.clear(); ai_history.clear()
+baseline_engine.reset(); alert_engine.reset_all()
+if current_patient:
+end_session(current_patient[0])
+refresh_hs_combo()
 
 def read_serial():
-    global last_temp
-    while running:
-        try:
-            raw = ser.readline().decode(errors="ignore").strip()
-            if not raw: continue
-            pkt = json.loads(raw)
-            if "event" in pkt: continue  # bỏ qua event message
+global last_temp
+while running:
+try:
+raw = ser.readline().decode(errors=“ignore”).strip()
+if not raw: continue
+pkt = json.loads(raw)
+if “event” in pkt: continue
 
-            finger = pkt.get("finger", False)
-            hr     = float(pkt.get("hr",   0))
-            spo2   = float(pkt.get("spo2", 0))
-            ppg    = float(pkt.get("ppg",  0))
+```
+        finger = pkt.get("finger", False)
+        hr     = float(pkt.get("hr",   0))
+        spo2   = float(pkt.get("spo2", 0))
+        ppg    = float(pkt.get("ppg",  0))
+        t      = float(pkt.get("temp", 0))
+        if t > 25.0 and t < 45.0: last_temp = t
 
-            # Đọc temp từ GY-906 qua JSON
-            t = float(pkt.get("temp", 0))
-            if t > 25.0 and t < 45.0:
-                last_temp = t
+        if hr>0 and (hr<20 or hr>250): continue
+        if spo2>0 and (spo2<50 or spo2>100): continue
+        if ppg < 1000: continue
 
-            if hr>0 and (hr<20 or hr>250): continue
-            if spo2>0 and (spo2<50 or spo2>100): continue
-            if ppg < 1000: continue
+        label, conf = hybrid_predict(ppg, hr, spo2, last_temp)
 
-            label, conf = hybrid_predict(ppg, hr, spo2, last_temp)
+        root.after(0, lambda p=ppg: _update_plot(p))
+        root.after(0, lambda f=finger, h=hr, s=spo2, p=ppg,
+                      lb=label, c=conf, t=last_temp:
+                      update_gui(f, h, s, p, lb, c, t))
 
-            root.after(0, lambda p=ppg: _update_plot(p))
-            root.after(0, lambda f=finger, h=hr, s=spo2, p=ppg,
-                          lb=label, c=conf, t=last_temp:
-                          update_gui(f, h, s, p, lb, c, t))
+        sig = np.array(ppg_buffer) if len(ppg_buffer)==WINDOW else np.zeros(WINDOW)
+        pi  = np.std(sig)/(np.mean(sig)+1e-6)*100
+        write_row(hr, spo2, last_temp, ppg, pi, label, conf)
+        history.append([time.time(), hr, spo2, last_temp, label, conf])
 
-            sig = np.array(ppg_buffer) if len(ppg_buffer)==WINDOW else np.zeros(WINDOW)
-            pi  = np.std(sig)/(np.mean(sig)+1e-6)*100
-            write_row(hr, spo2, last_temp, ppg, pi, label, conf)
-            history.append([time.time(), hr, spo2, last_temp, label, conf])
-
-        except Exception as e:
-            print("ERR:", e)
+    except Exception as e:
+        print("ERR:", e)
+```
 
 # ================================================================
-#  EXPORT REPORT
+
+# EXPORT REPORT
+
 # ================================================================
-def export_report():
-    if len(history) < 10:
-        messagebox.showwarning("","Can it nhat 10 mau"); return
-    hrs   = [h[1] for h in history]
-    spo2s = [h[2] for h in history]
-    temps = [h[3] for h in history]
-    risks = [h for h in history if h[4]=="RISK"]
-    rr    = len(risks)/len(history)*100
-    conc  = ("NGUY CO CAO"
-             if rr>30 or np.min(spo2s)<90 or np.mean(temps)>=38.3
-             else "NGUY CO THAP")
-    pinfo = (f"ID:{current_patient[0]} | {current_patient[1]} | SDT:{current_patient[2]}"
-             if current_patient else "Khong co ho so")
-    report = f"""
+
+# def export_report():
+if len(history) < 10:
+messagebox.showwarning(””,“Can it nhat 10 mau”); return
+hrs   = [h[1] for h in history]
+spo2s = [h[2] for h in history]
+temps = [h[3] for h in history]
+risks = [h for h in history if h[4]==“RISK”]
+rr    = len(risks)/len(history)*100
+conc  = (“NGUY CO CAO”
+if rr>30 or np.min(spo2s)<90 or np.mean(temps)>=38.3
+else “NGUY CO THAP”)
+pinfo = (f”ID:{current_patient[0]} | {current_patient[1]} | SDT:{current_patient[2]}”
+if current_patient else “Khong co ho so”)
+report = f”””
 AI SEPSIS - BAO CAO LAM SANG
-==============================
-Ngay      : {datetime.now().strftime('%d/%m/%Y %H:%M')}
+
+Ngay      : {datetime.now().strftime(’%d/%m/%Y %H:%M’)}
 Benh nhan : {pinfo}
 So mau    : {len(history)}
-Baseline  : HR={baseline_engine.baseline['hr']:.0f} SpO2={baseline_engine.baseline['spo2']:.0f} Temp={baseline_engine.baseline['temp']:.1f}
+Baseline  : HR={baseline_engine.baseline[‘hr’]:.0f} SpO2={baseline_engine.baseline[‘spo2’]:.0f} Temp={baseline_engine.baseline[‘temp’]:.1f}
 
--- Chi So Sinh Ton --
+– Chi So Sinh Ton –
 HR   : TB={np.mean(hrs):.1f} Max={np.max(hrs):.1f} Min={np.min(hrs):.1f} bpm
 SpO2 : TB={np.mean(spo2s):.1f}% Min={np.min(spo2s):.1f}%
 Nhiet: TB={np.mean(temps):.1f}C Max={np.max(temps):.1f}C (GY-906)
 
--- Phan Tich AI --
+– Phan Tich AI –
 Risk Events : {len(risks)} / {len(history)}
 Risk Rate   : {rr:.1f}%
 
--- Ket Luan --
+– Ket Luan –
 {conc}
 
 Chi ho tro lam sang, khong thay the bac si.
-"""
-    folder = DATA_DIR
-    if current_patient:
-        safe   = "".join(c for c in current_patient[1] if c.isalnum() or c in " _-")
-        folder = DATA_DIR / f"P{current_patient[0]:04d}_{safe}"
-        folder.mkdir(exist_ok=True)
-    path = folder / f"report_{int(time.time())}.txt"
-    with open(path,"w",encoding="utf-8-sig") as f: f.write(report)
-    messagebox.showinfo("OK", f"Da luu:\n{path}")
+“””
+folder = DATA_DIR
+if current_patient:
+safe   = “”.join(c for c in current_patient[1] if c.isalnum() or c in “ *-”)
+folder = DATA_DIR / f”P{current_patient[0]:04d}*{safe}”
+folder.mkdir(exist_ok=True)
+path = folder / f”report_{int(time.time())}.txt”
+with open(path,“w”,encoding=“utf-8-sig”) as f: f.write(report)
+messagebox.showinfo(“OK”, f”Da luu:\n{path}”)
 
 # ================================================================
-#  RUN
+
+# RUN
+
 # ================================================================
+
 root.mainloop()
