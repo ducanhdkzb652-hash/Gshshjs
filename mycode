@@ -1,7 +1,7 @@
 # ================================================================
 #  AI SEPSIS MONITOR - PROFESSIONAL EDITION
 #  Thong bao: Telegram + SpeedSMS + Gmail
-#  Nhiet do: GY-906 tu dong qua ESP32
+#  Email: gui bao cao sau moi lan do, nguoi nhan co the sua
 # ================================================================
 
 import serial
@@ -13,7 +13,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import csv, os, time, sqlite3, requests, winsound, base64
 import smtplib
-from email.mime.text import MIMEText
+from email.mime.text      import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -38,17 +39,17 @@ DB_PATH        = "sepsis_patients.db"
 DATA_DIR       = Path("patient_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# ── Thong bao ────────────────────────────────────────────────
-TELEGRAM_TOKEN   = ""   # token tu @BotFather
-TELEGRAM_CHAT_ID = ""   # chat ID cua ban
+# ── Thong bao ──────────────────────────────────────────────
+TELEGRAM_TOKEN   = ""
+TELEGRAM_CHAT_ID = ""
+SPEEDSMS_TOKEN   = ""
+SPEEDSMS_PHONE   = ""
+SPEEDSMS_SENDER  = "SepsisAI"
 
-SPEEDSMS_TOKEN  = ""    # token tu speedsms.vn
-SPEEDSMS_PHONE  = ""    # SDT nhan SMS (0901234567)
-SPEEDSMS_SENDER = "SepsisAI"
-
-GMAIL_USER = ""         # your@gmail.com
-GMAIL_PASS = ""         # App Password 16 ky tu
-GMAIL_TO   = ""         # SDT/email nhan canh bao
+# ── Gmail config ───────────────────────────────────────────
+EMAIL_SENDER   = "hayhovl123456@gmail.com"
+EMAIL_PASSWORD = "hksv zwlq uegg joad"
+EMAIL_TO       = "lenguyenmanhcuong58@gmail.com"  # mặc định, có thể sửa trong settings
 
 # ================= LOAD MODELS =================
 try:
@@ -121,96 +122,138 @@ def get_sessions(pid):
 init_db()
 
 # ================================================================
+#  EMAIL FUNCTIONS
+# ================================================================
+def send_email(subject: str, body: str, to: str = "") -> bool:
+    """Gui email qua Gmail. 'to' mac dinh lay tu EMAIL_TO."""
+    recipient = to if to else EMAIL_TO
+    if not EMAIL_SENDER or not EMAIL_PASSWORD or not recipient:
+        print("Gmail chua cau hinh"); return False
+    try:
+        msg            = MIMEMultipart()
+        msg["From"]    = EMAIL_SENDER
+        msg["To"]      = recipient
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, recipient, msg.as_string())
+        print(f"✅ Gmail OK → {recipient}")
+        return True
+    except smtplib.SMTPAuthenticationError:
+        print("❌ Sai App Password Gmail")
+        return False
+    except smtplib.SMTPException as e:
+        print(f"❌ Loi SMTP: {e}")
+        return False
+    except Exception as e:
+        print(f"❌ Gmail error: {e}")
+        return False
+
+
+def send_report_email(pname: str):
+    """Gui bao cao tong hop sau moi lan do."""
+    if len(history) < 5:
+        print("Qua it du lieu, khong gui email"); return
+
+    hrs   = [h[1] for h in history if h[1] > 0]
+    spo2s = [h[2] for h in history if h[2] > 0]
+    temps = [h[3] for h in history if h[3] > 0]
+    risks = [h for h in history if h[4] == "RISK"]
+
+    if not hrs or not spo2s: return
+
+    rr       = len(risks) / len(history) * 100
+    duration = int(history[-1][0] - history[0][0]) if len(history) > 1 else 0
+    conc     = ("NGUY CO CAO"
+                if rr > 30 or min(spo2s) < 90 or
+                   (temps and sum(temps)/len(temps) >= 38.3)
+                else "NGUY CO THAP")
+
+    body = f"""
+================================================================
+       SEPSIS AI - BAO CAO DO LUONG TU DONG
+================================================================
+
+Benh nhan : {pname}
+Thoi gian : {datetime.now().strftime('%d/%m/%Y %H:%M')}
+Thoi luong: {duration} giay
+So mau    : {len(history)}
+
+-- Chi So Sinh Ton --
+HR    : TB={sum(hrs)/len(hrs):.1f}  Max={max(hrs):.1f}  Min={min(hrs):.1f} bpm
+SpO2  : TB={sum(spo2s)/len(spo2s):.1f}%  Min={min(spo2s):.1f}%
+Nhiet : TB={sum(temps)/len(temps):.1f}C  Max={max(temps):.1f}C  (GY-906)
+
+-- Phan Tich AI --
+Risk Events : {len(risks)} / {len(history)}
+Ti le nguy co: {rr:.1f}%
+
+-- Ket Luan --
+{conc}
+
+================================================================
+Chi ho tro lam sang, khong thay the chan doan cua bac si.
+================================================================
+"""
+    subject = (f"SepsisAI Bao Cao | {pname} | "
+               f"{datetime.now().strftime('%d/%m/%Y %H:%M')}")
+
+    def _send():
+        send_email(subject, body)
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def send_alert_email(pname: str, msg: str):
+    """Gui email canh bao ngay lap tuc."""
+    subject = f"SepsisAI CANH BAO - {pname}"
+    body = (f"CANH BAO SEPSIS AI\n\n"
+            f"Benh nhan: {pname}\n"
+            f"{msg}\n"
+            f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}\n\n"
+            f"Vui long kiem tra ngay!")
+    def _send():
+        send_email(subject, body)
+    threading.Thread(target=_send, daemon=True).start()
+
+# ================================================================
 #  NOTIFICATION
 # ================================================================
 def send_telegram(message: str) -> bool:
-    """Gui tin nhan qua Telegram Bot."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram chua cau hinh"); return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id":    TELEGRAM_CHAT_ID,
-                "text":       message,
-                "parse_mode": "HTML"
-            }, timeout=5)
-        ok = r.status_code == 200
-        print(f"Telegram: {'OK' if ok else r.text[:60]}")
-        return ok
+            json={"chat_id": TELEGRAM_CHAT_ID,
+                  "text": message, "parse_mode": "HTML"}, timeout=5)
+        return r.status_code == 200
     except Exception as e:
         print(f"Telegram error: {e}"); return False
 
-
 def send_sms(phone: str, message: str) -> bool:
-    """Gui SMS qua SpeedSMS API."""
     if not SPEEDSMS_TOKEN or not phone:
         print("SpeedSMS chua cau hinh"); return False
     try:
-        credentials = base64.b64encode(
-            f"{SPEEDSMS_TOKEN}:0".encode()
-        ).decode()
+        credentials = base64.b64encode(f"{SPEEDSMS_TOKEN}:0".encode()).decode()
         r = requests.post(
             "https://api.speedsms.vn/index.php/sms/send",
-            json={
-                "to":       [phone],
-                "content":  message,
-                "sms_type": 2,
-                "sender":   SPEEDSMS_SENDER
-            },
-            headers={
-                "Authorization": f"Basic {credentials}",
-                "Content-Type":  "application/json"
-            }, timeout=5)
-        result = r.json()
-        ok = result.get("status") == "success"
-        print(f"SpeedSMS: {'OK' if ok else result}")
-        return ok
+            json={"to": [phone], "content": message,
+                  "sms_type": 2, "sender": SPEEDSMS_SENDER},
+            headers={"Authorization": f"Basic {credentials}",
+                     "Content-Type": "application/json"}, timeout=5)
+        return r.json().get("status") == "success"
     except Exception as e:
         print(f"SpeedSMS error: {e}"); return False
 
-
-def send_email(subject: str, body: str) -> bool:
-    """Gui email qua Gmail."""
-    if not GMAIL_USER or not GMAIL_PASS or not GMAIL_TO:
-        print("Gmail chua cau hinh"); return False
-    try:
-        msg            = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"]    = GMAIL_USER
-        msg["To"]      = GMAIL_TO
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(GMAIL_USER, GMAIL_PASS)
-            s.send_message(msg)
-        print("Gmail: OK"); return True
-    except Exception as e:
-        print(f"Gmail error: {e}"); return False
-
-
 def notify_all(pname: str, message: str, phone: str = ""):
-    """Gui thong bao qua tat ca kenh trong thread rieng."""
     def _send():
-        full_msg = (
-            f"SepsisAI Alert\n"
-            f"Benh nhan: {pname}\n"
-            f"{message}\n"
-            f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}"
-        )
-        tele_msg = (
-            f"<b>SepsisAI Alert</b>\n"
-            f"Benh nhan: <b>{pname}</b>\n"
-            f"{message}\n"
-            f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}"
-        )
-        # Telegram (nhanh nhat)
+        full_msg  = f"SepsisAI Alert\nBenh nhan: {pname}\n{message}\nThoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}"
+        tele_msg  = f"<b>SepsisAI Alert</b>\nBenh nhan: <b>{pname}</b>\n{message}\nThoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}"
         send_telegram(tele_msg)
-        # SpeedSMS
         target = phone or SPEEDSMS_PHONE
-        if target:
-            send_sms(target, full_msg)
-        # Gmail
+        if target: send_sms(target, full_msg)
         send_email(f"SepsisAI Alert - {pname}", full_msg)
-
     threading.Thread(target=_send, daemon=True).start()
 
 # ================================================================
@@ -418,7 +461,6 @@ baseline_var = tk.StringVar(value="Baseline: -")
 tk.Label(ctrl, textvariable=baseline_var,
          font=("Consolas",8), bg=BG, fg=GRAY).pack(side="right", padx=10)
 
-# Vitals cards
 cards_frame = tk.Frame(tab_monitor, bg=BG); cards_frame.pack(fill="x", padx=10, pady=4)
 
 def make_card(parent, title, var, unit, color):
@@ -454,10 +496,9 @@ tk.Label(ai_card, textvariable=conf_var,  font=("Consolas",8),        bg=CARD, f
 tk.Label(ai_card, textvariable=timer_var, font=("Consolas",8,"bold"), bg=CARD, fg=WARN).pack(pady=(0,6))
 
 tk.Label(tab_monitor,
-         text="Nhiet do tu dong tu GY-906 | Nhan nut tren ESP32 de do nhiet do",
+         text="Nhiet do tu dong tu GY-906 | Email bao cao gui tu dong sau moi lan do",
          font=("Consolas",8), bg=BG, fg=GRAY).pack(pady=2)
 
-# PPG Plot
 fig = Figure(figsize=(10, 2.5), facecolor=BG2)
 ax  = fig.add_subplot(111)
 ax.set_facecolor(BG2)
@@ -468,7 +509,6 @@ line_ppg, = ax.plot(np.arange(200), ppg_plot, color=ACC, linewidth=1.3, alpha=0.
 canvas = FigureCanvasTkAgg(fig, tab_monitor)
 canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=4)
 
-# Buttons
 mb = tk.Frame(tab_monitor, bg=BG); mb.pack(pady=6)
 def btn(parent, text, cmd, color=ACC):
     b = tk.Button(parent, text=text, command=cmd, bg=CARD, fg=color,
@@ -476,10 +516,11 @@ def btn(parent, text, cmd, color=ACC):
                   activebackground=BG2, activeforeground=color, cursor="hand2")
     b.pack(side="left", padx=6); return b
 
-btn(mb, "Xuat Bao Cao",  lambda: export_report())
-btn(mb, "Reset Baseline", lambda: baseline_engine.reset())
-btn(mb, "Xoa History",   lambda: history.clear())
-btn(mb, "Test Notify",   lambda: test_notify(), WARN)
+btn(mb, "Xuat Bao Cao",   lambda: export_report())
+btn(mb, "Reset Baseline",  lambda: baseline_engine.reset())
+btn(mb, "Xoa History",    lambda: history.clear())
+btn(mb, "Test Notify",    lambda: test_notify(), WARN)
+btn(mb, "Test Email",     lambda: test_email(),  WARN)
 
 # ── TAB BENH NHAN ────────────────────────────────────────────
 pf = tk.LabelFrame(tab_patients, text=" Them Benh Nhan Moi ",
@@ -586,28 +627,24 @@ tk.Label(sf, text="Cai Dat Thong Bao",
 
 cfg_fields = {}
 cfg_cfg = [
-    # Telegram
-    ("── Telegram ──────",  None,              None),
-    ("Telegram Token",       "tele_token",      TELEGRAM_TOKEN),
-    ("Telegram Chat ID",     "tele_chat",       TELEGRAM_CHAT_ID),
-    # SpeedSMS
-    ("── SpeedSMS ──────",  None,              None),
-    ("SpeedSMS Token",       "speed_token",     SPEEDSMS_TOKEN),
-    ("SpeedSMS Phone",       "speed_phone",     SPEEDSMS_PHONE),
-    ("SpeedSMS Sender",      "speed_sender",    SPEEDSMS_SENDER),
-    # Gmail
-    ("── Gmail ─────────",  None,              None),
-    ("Gmail User",           "gmail_user",      GMAIL_USER),
-    ("Gmail App Password",   "gmail_pass",      GMAIL_PASS),
-    ("Gmail To",             "gmail_to",        GMAIL_TO),
-    # General
-    ("── General ───────",  None,              None),
-    ("Confirm Sec",          "confirm_sec",     str(CONFIRM_SEC)),
+    ("── Telegram ──────", None,           None),
+    ("Telegram Token",     "tele_token",   TELEGRAM_TOKEN),
+    ("Telegram Chat ID",   "tele_chat",    TELEGRAM_CHAT_ID),
+    ("── SpeedSMS ──────", None,           None),
+    ("SpeedSMS Token",     "speed_token",  SPEEDSMS_TOKEN),
+    ("SpeedSMS Phone",     "speed_phone",  SPEEDSMS_PHONE),
+    ("SpeedSMS Sender",    "speed_sender", SPEEDSMS_SENDER),
+    # ── Email — có thể sửa người nhận ──
+    ("── Gmail ─────────", None,           None),
+    ("Gmail Nguoi gui",    "gmail_sender", EMAIL_SENDER),
+    ("Gmail App Password", "gmail_pass",   EMAIL_PASS if 'EMAIL_PASS' in dir() else EMAIL_PASSWORD),
+    ("Gmail Nguoi nhan",   "gmail_to",     EMAIL_TO),   # ← sửa được
+    ("── General ───────", None,           None),
+    ("Confirm Sec",        "confirm_sec",  str(CONFIRM_SEC)),
 ]
 
 for lbl, key, default in cfg_cfg:
     if key is None:
-        # Section header
         tk.Label(sf, text=lbl, font=("Consolas",8,"bold"),
                  bg=BG, fg=ACC).pack(anchor="w", pady=(8,2))
         continue
@@ -623,38 +660,38 @@ for lbl, key, default in cfg_cfg:
 def save_settings():
     global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
     global SPEEDSMS_TOKEN, SPEEDSMS_PHONE, SPEEDSMS_SENDER
-    global GMAIL_USER, GMAIL_PASS, GMAIL_TO, CONFIRM_SEC
+    global EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_TO, CONFIRM_SEC
 
     TELEGRAM_TOKEN   = cfg_fields["tele_token"].get()
     TELEGRAM_CHAT_ID = cfg_fields["tele_chat"].get()
     SPEEDSMS_TOKEN   = cfg_fields["speed_token"].get()
     SPEEDSMS_PHONE   = cfg_fields["speed_phone"].get()
     SPEEDSMS_SENDER  = cfg_fields["speed_sender"].get()
-    GMAIL_USER       = cfg_fields["gmail_user"].get()
-    GMAIL_PASS       = cfg_fields["gmail_pass"].get()
-    GMAIL_TO         = cfg_fields["gmail_to"].get()
+    EMAIL_SENDER     = cfg_fields["gmail_sender"].get()
+    EMAIL_PASSWORD   = cfg_fields["gmail_pass"].get()
+    EMAIL_TO         = cfg_fields["gmail_to"].get()   # ← người nhận cập nhật
     try:
         CONFIRM_SEC = int(cfg_fields["confirm_sec"].get())
         alert_engine.confirm_sec = CONFIRM_SEC
     except: pass
-    messagebox.showinfo("OK", "Da luu cai dat!")
+    messagebox.showinfo("OK", f"Da luu!\nEmail nguoi nhan: {EMAIL_TO}")
 
 btn_sf = tk.Frame(sf, bg=BG); btn_sf.pack(pady=8)
-btn(btn_sf, "Luu Cai Dat",  save_settings,         ACC)
+btn(btn_sf, "Luu Cai Dat", save_settings, ACC)
 btn(btn_sf, "Test Telegram", lambda: threading.Thread(
     target=lambda: send_telegram("Test tu SepsisAI"), daemon=True).start(), WARN)
-btn(btn_sf, "Test SMS",      lambda: threading.Thread(
+btn(btn_sf, "Test SMS", lambda: threading.Thread(
     target=lambda: send_sms(SPEEDSMS_PHONE, "Test SMS tu SepsisAI"), daemon=True).start(), WARN)
-btn(btn_sf, "Test Gmail",    lambda: threading.Thread(
-    target=lambda: send_email("SepsisAI Test", "Test email tu SepsisAI"), daemon=True).start(), WARN)
+btn(btn_sf, "Test Email", lambda: test_email(), WARN)
 
 tk.Label(sf,
-         text=(
-             "Telegram: Tao bot tai @BotFather tren Telegram\n"
-             "SpeedSMS: Dang ky tai speedsms.vn - lay Access Token\n"
-             "Gmail   : Bat 2FA > App Password > Tao mat khau 16 ky tu"
-         ),
-         font=("Consolas",8), bg=BG, fg=GRAY, justify="left").pack(anchor="w", pady=8)
+         text="Gmail Nguoi nhan: co the sua truc tiep o tren roi bam Luu Cai Dat",
+         font=("Consolas",8), bg=BG, fg=GREEN, justify="left").pack(anchor="w", pady=4)
+tk.Label(sf,
+         text=("Telegram: Tao bot tai @BotFather\n"
+               "SpeedSMS: Dang ky tai speedsms.vn\n"
+               "Gmail   : Bat 2FA > App Password > 16 ky tu"),
+         font=("Consolas",8), bg=BG, fg=GRAY, justify="left").pack(anchor="w", pady=4)
 
 # ================================================================
 #  PLOT UPDATE
@@ -675,7 +712,6 @@ def _update_plot(ppg_val):
 # ================================================================
 def update_gui(finger, hr, spo2, ppg, label, conf, temp):
     baseline_var.set(f"Baseline: {baseline_engine.status}")
-
     if not finger:
         finger_var.set("NO"); ai_var.set("NO FINGER")
         ai_label_w.config(fg=GRAY); timer_var.set("")
@@ -739,12 +775,28 @@ def _do_alert(msg, pname, phone):
     except: pass
     messagebox.showwarning("ALERT", f"Benh nhan: {pname}\n{msg}")
     notify_all(pname, msg, phone)
+    send_alert_email(pname, msg)   # ← gửi email cảnh báo ngay
 
 def test_notify():
     if not current_patient:
         messagebox.showwarning("","Chon benh nhan truoc"); return
     notify_all(current_patient[1], "Day la tin nhan test tu SepsisAI.", current_patient[2])
     messagebox.showinfo("OK","Da gui thong bao test")
+
+def test_email():
+    """Test gui email den nguoi nhan hien tai."""
+    def _t():
+        ok = send_email(
+            "SepsisAI Test Email",
+            f"Day la email test tu SepsisAI Monitor.\n"
+            f"Nguoi nhan: {EMAIL_TO}\n"
+            f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}"
+        )
+        root.after(0, lambda: messagebox.showinfo(
+            "OK" if ok else "LOI",
+            f"{'Da gui den: '+EMAIL_TO if ok else 'Gui that bai - kiem tra lai cau hinh Gmail'}"
+        ))
+    threading.Thread(target=_t, daemon=True).start()
 
 # ================================================================
 #  SERIAL
@@ -771,6 +823,13 @@ def disconnect():
     status_var.set("OFFLINE")
     ppg_buffer.clear(); ai_history.clear()
     baseline_engine.reset(); alert_engine.reset_all()
+
+    # ── Gửi báo cáo email tự động ──
+    if len(history) >= 5:
+        pname = current_patient[1] if current_patient else "Khong ro"
+        send_report_email(pname)
+        print(f"Dang gui bao cao email den {EMAIL_TO}...")
+
     if current_patient:
         end_session(current_patient[0])
         refresh_hs_combo()
