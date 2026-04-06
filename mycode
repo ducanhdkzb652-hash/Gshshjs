@@ -1,7 +1,7 @@
 # ================================================================
 #  AI SEPSIS MONITOR - PROFESSIONAL EDITION
-#  Thong bao: Telegram + SpeedSMS + Gmail
-#  Email: gui bao cao sau moi lan do, nguoi nhan co the sua
+#  Thong bao: Telegram + Gmail + SMS qua ESP32-S3 A7680C
+#  SĐT nhan SMS: chinh trong Tab Cai Dat
 # ================================================================
 
 import serial
@@ -39,17 +39,27 @@ DB_PATH        = "sepsis_patients.db"
 DATA_DIR       = Path("patient_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# ── Thong bao ──────────────────────────────────────────────
+# ── Telegram ──────────────────────────────
 TELEGRAM_TOKEN   = ""
 TELEGRAM_CHAT_ID = ""
-SPEEDSMS_TOKEN   = ""
-SPEEDSMS_PHONE   = ""
-SPEEDSMS_SENDER  = "SepsisAI"
 
-# ── Gmail config ───────────────────────────────────────────
-EMAIL_SENDER   = "hayhovl123456@gmail.com"
-EMAIL_PASSWORD = "hksv zwlq uegg joad"
-EMAIL_TO       = "lenguyenmanhcuong58@gmail.com"  # mặc định, có thể sửa trong settings
+# ── SpeedSMS ──────────────────────────────
+SPEEDSMS_TOKEN  = ""
+SPEEDSMS_PHONE  = ""
+SPEEDSMS_SENDER = "SepsisAI"
+
+# ── Gmail ─────────────────────────────────
+GMAIL_SENDER   = "hayhovl123456@gmail.com"
+GMAIL_PASSWORD = "hksv zwlq uegg joad"
+GMAIL_TO       = "lenguyenmanhcuong58@gmail.com"
+
+# ── SMS Gateway qua ESP32-S3 ──────────────
+ESP32_S3_IP  = "192.168.1.xxx"   # ← đổi IP thật của ESP32-S3
+ESP32_S3_PORT= 80
+SMS_PHONE    = "0901234567"      # ← SĐT nhận SMS, sửa được trong settings
+
+def _s3_url(path):
+    return f"http://{ESP32_S3_IP}:{ESP32_S3_PORT}{path}"
 
 # ================= LOAD MODELS =================
 try:
@@ -122,99 +132,153 @@ def get_sessions(pid):
 init_db()
 
 # ================================================================
-#  EMAIL FUNCTIONS
+#  SMS QUA ESP32-S3
 # ================================================================
-def send_email(subject: str, body: str, to: str = "") -> bool:
-    """Gui email qua Gmail. 'to' mac dinh lay tu EMAIL_TO."""
-    recipient = to if to else EMAIL_TO
-    if not EMAIL_SENDER or not EMAIL_PASSWORD or not recipient:
-        print("Gmail chua cau hinh"); return False
+def send_sms_via_s3(phone: str, message: str) -> bool:
+    """Gui SMS qua ESP32-S3 gateway."""
     try:
-        msg            = MIMEMultipart()
-        msg["From"]    = EMAIL_SENDER
-        msg["To"]      = recipient
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, recipient, msg.as_string())
-        print(f"✅ Gmail OK → {recipient}")
-        return True
-    except smtplib.SMTPAuthenticationError:
-        print("❌ Sai App Password Gmail")
-        return False
-    except smtplib.SMTPException as e:
-        print(f"❌ Loi SMTP: {e}")
+        r = requests.post(
+            _s3_url("/sms"),
+            json={"phone": phone, "message": message},
+            timeout=10
+        )
+        ok = r.json().get("status") == "sent"
+        print(f"SMS S3: {'OK' if ok else 'FAIL'} → {phone}")
+        return ok
+    except requests.exceptions.ConnectionError:
+        print(f"SMS S3: Khong ket noi duoc {ESP32_S3_IP}")
         return False
     except Exception as e:
-        print(f"❌ Gmail error: {e}")
+        print(f"SMS S3 error: {e}")
         return False
 
 
-def send_report_email(pname: str):
-    """Gui bao cao tong hop sau moi lan do."""
-    if len(history) < 5:
-        print("Qua it du lieu, khong gui email"); return
+def send_alert_via_s3(pname: str, alert_msg: str,
+                       hr: float = 0, spo2: float = 0, temp: float = 0):
+    """Gui canh bao SMS qua ESP32-S3."""
+    def _send():
+        try:
+            r = requests.post(
+                _s3_url("/alert"),
+                json={
+                    "phone":   SMS_PHONE,
+                    "patient": pname,
+                    "alert":   alert_msg,
+                    "hr":      int(hr),
+                    "spo2":    int(spo2),
+                    "temp":    round(float(temp), 1)
+                },
+                timeout=10
+            )
+            ok = r.json().get("status") == "alert_sent"
+            print(f"Alert SMS S3: {'OK' if ok else 'FAIL'}")
+        except requests.exceptions.ConnectionError:
+            print(f"Alert S3: Khong ket noi duoc {ESP32_S3_IP}")
+        except Exception as e:
+            print(f"Alert S3 error: {e}")
+    threading.Thread(target=_send, daemon=True).start()
 
+
+def send_report_via_s3(pname: str):
+    """Gui bao cao SMS qua ESP32-S3 sau moi lan do."""
+    if len(history) < 5: return
     hrs   = [h[1] for h in history if h[1] > 0]
     spo2s = [h[2] for h in history if h[2] > 0]
     temps = [h[3] for h in history if h[3] > 0]
     risks = [h for h in history if h[4] == "RISK"]
-
     if not hrs or not spo2s: return
+    rr   = len(risks) / len(history) * 100
+    conc = "NGUY CO CAO" if rr > 30 or (spo2s and min(spo2s) < 90) \
+           else "NGUY CO THAP"
+    def _send():
+        try:
+            r = requests.post(
+                _s3_url("/report"),
+                json={
+                    "phone":      SMS_PHONE,
+                    "patient":    pname,
+                    "hr":         round(sum(hrs)/len(hrs), 1),
+                    "spo2":       round(sum(spo2s)/len(spo2s), 1),
+                    "temp":       round(sum(temps)/len(temps) if temps else 0, 1),
+                    "risk_rate":  round(rr, 1),
+                    "conclusion": conc,
+                    "samples":    len(history)
+                },
+                timeout=10
+            )
+            ok = r.json().get("status") == "report_sent"
+            print(f"Report SMS S3: {'OK' if ok else 'FAIL'}")
+        except requests.exceptions.ConnectionError:
+            print(f"Report S3: Khong ket noi duoc {ESP32_S3_IP}")
+        except Exception as e:
+            print(f"Report S3 error: {e}")
+    threading.Thread(target=_send, daemon=True).start()
 
+# ================================================================
+#  EMAIL
+# ================================================================
+def _send_email_core(to: str, subject: str, body: str) -> bool:
+    if not GMAIL_SENDER or not GMAIL_PASSWORD or not to:
+        print("Gmail chua cau hinh"); return False
+    try:
+        msg            = MIMEMultipart()
+        msg["From"]    = GMAIL_SENDER
+        msg["To"]      = to
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
+            server.sendmail(GMAIL_SENDER, to, msg.as_string())
+        print(f"✅ Gmail OK → {to}"); return True
+    except smtplib.SMTPAuthenticationError:
+        print("❌ Sai App Password Gmail"); return False
+    except Exception as e:
+        print(f"❌ Gmail error: {e}"); return False
+
+def send_email(subject: str, body: str) -> bool:
+    return _send_email_core(GMAIL_TO, subject, body)
+
+def send_report_email(pname: str):
+    if len(history) < 5: return
+    hrs   = [h[1] for h in history if h[1] > 0]
+    spo2s = [h[2] for h in history if h[2] > 0]
+    temps = [h[3] for h in history if h[3] > 0]
+    risks = [h for h in history if h[4] == "RISK"]
+    if not hrs or not spo2s: return
     rr       = len(risks) / len(history) * 100
     duration = int(history[-1][0] - history[0][0]) if len(history) > 1 else 0
     conc     = ("NGUY CO CAO"
-                if rr > 30 or min(spo2s) < 90 or
+                if rr > 30 or (spo2s and min(spo2s) < 90) or
                    (temps and sum(temps)/len(temps) >= 38.3)
                 else "NGUY CO THAP")
-
     body = f"""
 ================================================================
        SEPSIS AI - BAO CAO DO LUONG TU DONG
 ================================================================
-
-Benh nhan : {pname}
-Thoi gian : {datetime.now().strftime('%d/%m/%Y %H:%M')}
-Thoi luong: {duration} giay
-So mau    : {len(history)}
-
+Benh nhan  : {pname}
+Thoi gian  : {datetime.now().strftime('%d/%m/%Y %H:%M')}
+Thoi luong : {duration} giay | So mau: {len(history)}
 -- Chi So Sinh Ton --
 HR    : TB={sum(hrs)/len(hrs):.1f}  Max={max(hrs):.1f}  Min={min(hrs):.1f} bpm
 SpO2  : TB={sum(spo2s)/len(spo2s):.1f}%  Min={min(spo2s):.1f}%
-Nhiet : TB={sum(temps)/len(temps):.1f}C  Max={max(temps):.1f}C  (GY-906)
-
+Nhiet : TB={sum(temps)/len(temps) if temps else 0:.1f}C
 -- Phan Tich AI --
-Risk Events : {len(risks)} / {len(history)}
-Ti le nguy co: {rr:.1f}%
-
--- Ket Luan --
-{conc}
-
-================================================================
-Chi ho tro lam sang, khong thay the chan doan cua bac si.
+Risk Events: {len(risks)}/{len(history)} | Ti le: {rr:.1f}%
+-- Ket Luan: {conc} --
 ================================================================
 """
-    subject = (f"SepsisAI Bao Cao | {pname} | "
-               f"{datetime.now().strftime('%d/%m/%Y %H:%M')}")
-
-    def _send():
-        send_email(subject, body)
-    threading.Thread(target=_send, daemon=True).start()
-
+    subject = f"SepsisAI Bao Cao | {pname} | {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    threading.Thread(
+        target=lambda: _send_email_core(GMAIL_TO, subject, body),
+        daemon=True).start()
 
 def send_alert_email(pname: str, msg: str):
-    """Gui email canh bao ngay lap tuc."""
     subject = f"SepsisAI CANH BAO - {pname}"
-    body = (f"CANH BAO SEPSIS AI\n\n"
-            f"Benh nhan: {pname}\n"
-            f"{msg}\n"
-            f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}\n\n"
-            f"Vui long kiem tra ngay!")
-    def _send():
-        send_email(subject, body)
-    threading.Thread(target=_send, daemon=True).start()
+    body = (f"CANH BAO SEPSIS AI\nBenh nhan: {pname}\n{msg}\n"
+            f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
+    threading.Thread(
+        target=lambda: _send_email_core(GMAIL_TO, subject, body),
+        daemon=True).start()
 
 # ================================================================
 #  NOTIFICATION
@@ -248,8 +312,10 @@ def send_sms(phone: str, message: str) -> bool:
 
 def notify_all(pname: str, message: str, phone: str = ""):
     def _send():
-        full_msg  = f"SepsisAI Alert\nBenh nhan: {pname}\n{message}\nThoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}"
-        tele_msg  = f"<b>SepsisAI Alert</b>\nBenh nhan: <b>{pname}</b>\n{message}\nThoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}"
+        full_msg = (f"SepsisAI Alert\nBenh nhan: {pname}\n"
+                    f"{message}\nThoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
+        tele_msg = (f"<b>SepsisAI Alert</b>\nBenh nhan: <b>{pname}</b>\n"
+                    f"{message}\nThoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
         send_telegram(tele_msg)
         target = phone or SPEEDSMS_PHONE
         if target: send_sms(target, full_msg)
@@ -299,7 +365,7 @@ class PersonalizedBaseline:
             self._buf[k].append(v)
         self.n += 1
         if self.n >= self.CALIBRATION_N:
-            self.baseline   = {k:float(np.median(v)) for k,v in self._buf.items()}
+            self.baseline = {k:float(np.median(v)) for k,v in self._buf.items()}
             self.calibrated = True
 
     def reset(self): self.__init__()
@@ -495,9 +561,14 @@ ai_label_w.pack()
 tk.Label(ai_card, textvariable=conf_var,  font=("Consolas",8),        bg=CARD, fg=GRAY).pack()
 tk.Label(ai_card, textvariable=timer_var, font=("Consolas",8,"bold"), bg=CARD, fg=WARN).pack(pady=(0,6))
 
-tk.Label(tab_monitor,
-         text="Nhiet do tu dong tu GY-906 | Email bao cao gui tu dong sau moi lan do",
-         font=("Consolas",8), bg=BG, fg=GRAY).pack(pady=2)
+# Info bar
+info_frame = tk.Frame(tab_monitor, bg=BG); info_frame.pack(fill="x", padx=10)
+email_to_var = tk.StringVar(value=f"Email: {GMAIL_TO}")
+sms_to_var   = tk.StringVar(value=f"SMS: {SMS_PHONE}")
+tk.Label(info_frame, textvariable=email_to_var,
+         font=("Consolas",8), bg=BG, fg=GREEN).pack(side="left", padx=6)
+tk.Label(info_frame, textvariable=sms_to_var,
+         font=("Consolas",8), bg=BG, fg="#bb86fc").pack(side="left", padx=6)
 
 fig = Figure(figsize=(10, 2.5), facecolor=BG2)
 ax  = fig.add_subplot(111)
@@ -516,11 +587,11 @@ def btn(parent, text, cmd, color=ACC):
                   activebackground=BG2, activeforeground=color, cursor="hand2")
     b.pack(side="left", padx=6); return b
 
-btn(mb, "Xuat Bao Cao",   lambda: export_report())
-btn(mb, "Reset Baseline",  lambda: baseline_engine.reset())
-btn(mb, "Xoa History",    lambda: history.clear())
-btn(mb, "Test Notify",    lambda: test_notify(), WARN)
-btn(mb, "Test Email",     lambda: test_email(),  WARN)
+btn(mb, "Xuat Bao Cao",  lambda: export_report())
+btn(mb, "Reset Baseline", lambda: baseline_engine.reset())
+btn(mb, "Xoa History",   lambda: history.clear())
+btn(mb, "Test Email",    lambda: test_email(),    WARN)
+btn(mb, "Test SMS S3",   lambda: test_sms_s3(),   "#bb86fc")
 
 # ── TAB BENH NHAN ────────────────────────────────────────────
 pf = tk.LabelFrame(tab_patients, text=" Them Benh Nhan Moi ",
@@ -627,20 +698,18 @@ tk.Label(sf, text="Cai Dat Thong Bao",
 
 cfg_fields = {}
 cfg_cfg = [
-    ("── Telegram ──────", None,           None),
-    ("Telegram Token",     "tele_token",   TELEGRAM_TOKEN),
-    ("Telegram Chat ID",   "tele_chat",    TELEGRAM_CHAT_ID),
-    ("── SpeedSMS ──────", None,           None),
-    ("SpeedSMS Token",     "speed_token",  SPEEDSMS_TOKEN),
-    ("SpeedSMS Phone",     "speed_phone",  SPEEDSMS_PHONE),
-    ("SpeedSMS Sender",    "speed_sender", SPEEDSMS_SENDER),
-    # ── Email — có thể sửa người nhận ──
-    ("── Gmail ─────────", None,           None),
-    ("Gmail Nguoi gui",    "gmail_sender", EMAIL_SENDER),
-    ("Gmail App Password", "gmail_pass",   EMAIL_PASS if 'EMAIL_PASS' in dir() else EMAIL_PASSWORD),
-    ("Gmail Nguoi nhan",   "gmail_to",     EMAIL_TO),   # ← sửa được
-    ("── General ───────", None,           None),
-    ("Confirm Sec",        "confirm_sec",  str(CONFIRM_SEC)),
+    ("── Telegram ──────",  None,           None),
+    ("Telegram Token",       "tele_token",   TELEGRAM_TOKEN),
+    ("Telegram Chat ID",     "tele_chat",    TELEGRAM_CHAT_ID),
+    ("── Gmail ─────────",  None,           None),
+    ("Gmail Nguoi gui",      "gmail_sender", GMAIL_SENDER),
+    ("Gmail App Password",   "gmail_pass",   GMAIL_PASSWORD),
+    ("Gmail Nguoi nhan",     "gmail_to",     GMAIL_TO),       # ← sửa được
+    ("── SMS qua ESP32-S3 ──", None,         None),
+    ("ESP32-S3 IP",          "s3_ip",        ESP32_S3_IP),
+    ("SDT nhan SMS",         "s3_phone",     SMS_PHONE),      # ← sửa được
+    ("── General ───────",  None,           None),
+    ("Confirm Sec",          "confirm_sec",  str(CONFIRM_SEC)),
 ]
 
 for lbl, key, default in cfg_cfg:
@@ -651,47 +720,60 @@ for lbl, key, default in cfg_cfg:
     r = tk.Frame(sf, bg=BG); r.pack(fill="x", pady=2)
     tk.Label(r, text=f"{lbl}:", width=22, anchor="w",
              font=("Consolas",9), bg=BG, fg=GRAY).pack(side="left")
+
+    # Highlight ô sửa được
+    editable = key in ("gmail_to", "s3_phone", "s3_ip")
     e = tk.Entry(r, width=38, font=("Consolas",10),
-                 bg=CARD, fg=TEXT, insertbackground=ACC, relief="flat",
+                 bg="#0d2b0d" if editable else CARD,
+                 fg=GREEN    if editable else TEXT,
+                 insertbackground=GREEN if editable else ACC,
+                 relief="flat",
                  show="*" if "pass" in key.lower() or "token" in key.lower() else "")
     e.insert(0, default or ""); e.pack(side="left", padx=6)
     cfg_fields[key] = e
 
+    if editable:
+        tk.Label(r, text="← SUA DUOC", font=("Consolas",8,"bold"),
+                 bg=BG, fg=GREEN).pack(side="left")
+
 def save_settings():
     global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-    global SPEEDSMS_TOKEN, SPEEDSMS_PHONE, SPEEDSMS_SENDER
-    global EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_TO, CONFIRM_SEC
+    global GMAIL_SENDER, GMAIL_PASSWORD, GMAIL_TO
+    global ESP32_S3_IP, SMS_PHONE, CONFIRM_SEC
 
     TELEGRAM_TOKEN   = cfg_fields["tele_token"].get()
     TELEGRAM_CHAT_ID = cfg_fields["tele_chat"].get()
-    SPEEDSMS_TOKEN   = cfg_fields["speed_token"].get()
-    SPEEDSMS_PHONE   = cfg_fields["speed_phone"].get()
-    SPEEDSMS_SENDER  = cfg_fields["speed_sender"].get()
-    EMAIL_SENDER     = cfg_fields["gmail_sender"].get()
-    EMAIL_PASSWORD   = cfg_fields["gmail_pass"].get()
-    EMAIL_TO         = cfg_fields["gmail_to"].get()   # ← người nhận cập nhật
+    GMAIL_SENDER     = cfg_fields["gmail_sender"].get()
+    GMAIL_PASSWORD   = cfg_fields["gmail_pass"].get()
+    GMAIL_TO         = cfg_fields["gmail_to"].get().strip()
+    ESP32_S3_IP      = cfg_fields["s3_ip"].get().strip()
+    SMS_PHONE        = cfg_fields["s3_phone"].get().strip()
     try:
         CONFIRM_SEC = int(cfg_fields["confirm_sec"].get())
         alert_engine.confirm_sec = CONFIRM_SEC
     except: pass
-    messagebox.showinfo("OK", f"Da luu!\nEmail nguoi nhan: {EMAIL_TO}")
+
+    # Cập nhật info bar
+    email_to_var.set(f"Email: {GMAIL_TO}")
+    sms_to_var.set(f"SMS: {SMS_PHONE}")
+    messagebox.showinfo("OK",
+        f"Da luu!\n"
+        f"Email gui den : {GMAIL_TO}\n"
+        f"SMS gui den   : {SMS_PHONE}\n"
+        f"ESP32-S3 IP   : {ESP32_S3_IP}")
 
 btn_sf = tk.Frame(sf, bg=BG); btn_sf.pack(pady=8)
-btn(btn_sf, "Luu Cai Dat", save_settings, ACC)
-btn(btn_sf, "Test Telegram", lambda: threading.Thread(
+btn(btn_sf, "Luu Cai Dat",   save_settings, ACC)
+btn(btn_sf, "Test Telegram",  lambda: threading.Thread(
     target=lambda: send_telegram("Test tu SepsisAI"), daemon=True).start(), WARN)
-btn(btn_sf, "Test SMS", lambda: threading.Thread(
-    target=lambda: send_sms(SPEEDSMS_PHONE, "Test SMS tu SepsisAI"), daemon=True).start(), WARN)
-btn(btn_sf, "Test Email", lambda: test_email(), WARN)
+btn(btn_sf, "Test Email",     lambda: test_email(),  WARN)
+btn(btn_sf, "Test SMS S3",    lambda: test_sms_s3(), "#bb86fc")
 
 tk.Label(sf,
-         text="Gmail Nguoi nhan: co the sua truc tiep o tren roi bam Luu Cai Dat",
-         font=("Consolas",8), bg=BG, fg=GREEN, justify="left").pack(anchor="w", pady=4)
-tk.Label(sf,
-         text=("Telegram: Tao bot tai @BotFather\n"
-               "SpeedSMS: Dang ky tai speedsms.vn\n"
-               "Gmail   : Bat 2FA > App Password > 16 ky tu"),
-         font=("Consolas",8), bg=BG, fg=GRAY, justify="left").pack(anchor="w", pady=4)
+         text=("O mau xanh la: co the sua truc tiep → bam Luu Cai Dat\n"
+               "ESP32-S3 IP: xem tren Serial Monitor cua S3 sau khi nap code\n"
+               "Telegram: @BotFather  |  Gmail: 2FA → App Password"),
+         font=("Consolas",8), bg=BG, fg=GRAY, justify="left").pack(anchor="w", pady=8)
 
 # ================================================================
 #  PLOT UPDATE
@@ -768,34 +850,36 @@ def update_gui(finger, hr, spo2, ppg, label, conf, temp):
     timer_var.set("  ".join(active))
 
     if alert_msg:
-        root.after(0, lambda m=alert_msg, n=pname, p=pphone: _do_alert(m,n,p))
+        root.after(0, lambda m=alert_msg, n=pname, p=pphone,
+                      h=hr, s=spo2, t=temp: _do_alert(m,n,p,h,s,t))
 
-def _do_alert(msg, pname, phone):
+def _do_alert(msg, pname, phone, hr=0, spo2=0, temp=0):
     try: winsound.Beep(1000, 600)
     except: pass
     messagebox.showwarning("ALERT", f"Benh nhan: {pname}\n{msg}")
     notify_all(pname, msg, phone)
-    send_alert_email(pname, msg)   # ← gửi email cảnh báo ngay
-
-def test_notify():
-    if not current_patient:
-        messagebox.showwarning("","Chon benh nhan truoc"); return
-    notify_all(current_patient[1], "Day la tin nhan test tu SepsisAI.", current_patient[2])
-    messagebox.showinfo("OK","Da gui thong bao test")
+    send_alert_email(pname, msg)
+    send_alert_via_s3(pname, msg, hr=hr, spo2=spo2, temp=temp)  # ← SMS qua S3
 
 def test_email():
-    """Test gui email den nguoi nhan hien tai."""
     def _t():
-        ok = send_email(
-            "SepsisAI Test Email",
-            f"Day la email test tu SepsisAI Monitor.\n"
-            f"Nguoi nhan: {EMAIL_TO}\n"
-            f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}"
-        )
+        ok = _send_email_core(GMAIL_TO, "SepsisAI Test",
+            f"Test email.\nNguoi nhan: {GMAIL_TO}\n"
+            f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
         root.after(0, lambda: messagebox.showinfo(
             "OK" if ok else "LOI",
-            f"{'Da gui den: '+EMAIL_TO if ok else 'Gui that bai - kiem tra lai cau hinh Gmail'}"
-        ))
+            f"{'Da gui den: '+GMAIL_TO if ok else 'Gui that bai!'}"))
+    threading.Thread(target=_t, daemon=True).start()
+
+def test_sms_s3():
+    def _t():
+        ok = send_sms_via_s3(SMS_PHONE,
+            f"Test SMS tu SepsisAI\nSDT: {SMS_PHONE}\n"
+            f"S3 IP: {ESP32_S3_IP}\n"
+            f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
+        root.after(0, lambda: messagebox.showinfo(
+            "OK" if ok else "LOI",
+            f"{'SMS da gui den: '+SMS_PHONE if ok else 'Gui that bai! Kiem tra IP ESP32-S3'}"))
     threading.Thread(target=_t, daemon=True).start()
 
 # ================================================================
@@ -824,11 +908,10 @@ def disconnect():
     ppg_buffer.clear(); ai_history.clear()
     baseline_engine.reset(); alert_engine.reset_all()
 
-    # ── Gửi báo cáo email tự động ──
     if len(history) >= 5:
         pname = current_patient[1] if current_patient else "Khong ro"
-        send_report_email(pname)
-        print(f"Dang gui bao cao email den {EMAIL_TO}...")
+        send_report_email(pname)       # Gmail
+        send_report_via_s3(pname)      # SMS qua ESP32-S3
 
     if current_patient:
         end_session(current_patient[0])
@@ -902,8 +985,7 @@ Nhiet: TB={np.mean(temps):.1f}C Max={np.max(temps):.1f}C (GY-906)
 Risk Events : {len(risks)} / {len(history)}
 Risk Rate   : {rr:.1f}%
 
--- Ket Luan --
-{conc}
+-- Ket Luan: {conc} --
 
 Chi ho tro lam sang, khong thay the bac si.
 """
