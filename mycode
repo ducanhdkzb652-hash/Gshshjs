@@ -1,6 +1,7 @@
 # ================================================================
 #  AI SEPSIS MONITOR - PROFESSIONAL EDITION
 #  Thong bao: Telegram + Gmail + SMS qua ESP32-S3 A7680C
+#  WiFi ESP32-S3: cau hinh truc tiep tu Python
 #  SĐT nhan SMS: chinh trong Tab Cai Dat
 # ================================================================
 
@@ -43,23 +44,22 @@ DATA_DIR.mkdir(exist_ok=True)
 TELEGRAM_TOKEN   = ""
 TELEGRAM_CHAT_ID = ""
 
-# ── SpeedSMS ──────────────────────────────
-SPEEDSMS_TOKEN  = ""
-SPEEDSMS_PHONE  = ""
-SPEEDSMS_SENDER = "SepsisAI"
-
 # ── Gmail ─────────────────────────────────
 GMAIL_SENDER   = "hayhovl123456@gmail.com"
 GMAIL_PASSWORD = "hksv zwlq uegg joad"
 GMAIL_TO       = "lenguyenmanhcuong58@gmail.com"
 
 # ── SMS Gateway qua ESP32-S3 ──────────────
-ESP32_S3_IP  = "192.168.1.xxx"   # ← đổi IP thật của ESP32-S3
-ESP32_S3_PORT= 80
-SMS_PHONE    = "0901234567"      # ← SĐT nhận SMS, sửa được trong settings
+ESP32_S3_IP   = "192.168.1.xxx"  # ← đổi IP thật sau khi cấu hình WiFi
+ESP32_S3_PORT = 80
+SMS_PHONE     = "0901234567"     # ← SĐT nhận SMS
 
-def _s3_url(path):
-    return f"http://{ESP32_S3_IP}:{ESP32_S3_PORT}{path}"
+# IP của S3 khi ở AP mode (cố định)
+S3_AP_IP = "192.168.4.1"
+
+def _s3_url(path, use_ap=False):
+    ip = S3_AP_IP if use_ap else ESP32_S3_IP
+    return f"http://{ip}:{ESP32_S3_PORT}{path}"
 
 # ================= LOAD MODELS =================
 try:
@@ -134,14 +134,44 @@ init_db()
 # ================================================================
 #  SMS QUA ESP32-S3
 # ================================================================
+def send_wifi_to_s3(ssid: str, pwd: str) -> bool:
+    """
+    Gui WiFi credentials den ESP32-S3 dang o AP mode.
+    Laptop phai ket noi WiFi 'SepsisAI_GW' truoc.
+    """
+    try:
+        r = requests.post(
+            _s3_url("/wifi", use_ap=True),
+            json={"ssid": ssid, "pass": pwd},
+            timeout=5)
+        ok = r.status_code == 200
+        print(f"Gui WiFi S3: {'OK' if ok else 'FAIL'} → {ssid}")
+        return ok
+    except requests.exceptions.ConnectionError:
+        print("Gui WiFi S3: Khong ket noi duoc 192.168.4.1")
+        print("→ Laptop phai ket noi WiFi 'SepsisAI_GW' truoc!")
+        return False
+    except Exception as e:
+        print(f"Gui WiFi S3 error: {e}")
+        return False
+
+
+def check_s3_status() -> dict:
+    """Kiem tra trang thai ESP32-S3."""
+    try:
+        r = requests.get(_s3_url("/status"), timeout=3)
+        return r.json()
+    except:
+        return {}
+
+
 def send_sms_via_s3(phone: str, message: str) -> bool:
     """Gui SMS qua ESP32-S3 gateway."""
     try:
         r = requests.post(
             _s3_url("/sms"),
             json={"phone": phone, "message": message},
-            timeout=10
-        )
+            timeout=10)
         ok = r.json().get("status") == "sent"
         print(f"SMS S3: {'OK' if ok else 'FAIL'} → {phone}")
         return ok
@@ -155,7 +185,7 @@ def send_sms_via_s3(phone: str, message: str) -> bool:
 
 def send_alert_via_s3(pname: str, alert_msg: str,
                        hr: float = 0, spo2: float = 0, temp: float = 0):
-    """Gui canh bao SMS qua ESP32-S3."""
+    """Gui canh bao SMS qua ESP32-S3 (chay trong thread)."""
     def _send():
         try:
             r = requests.post(
@@ -167,9 +197,7 @@ def send_alert_via_s3(pname: str, alert_msg: str,
                     "hr":      int(hr),
                     "spo2":    int(spo2),
                     "temp":    round(float(temp), 1)
-                },
-                timeout=10
-            )
+                }, timeout=10)
             ok = r.json().get("status") == "alert_sent"
             print(f"Alert SMS S3: {'OK' if ok else 'FAIL'}")
         except requests.exceptions.ConnectionError:
@@ -188,8 +216,7 @@ def send_report_via_s3(pname: str):
     risks = [h for h in history if h[4] == "RISK"]
     if not hrs or not spo2s: return
     rr   = len(risks) / len(history) * 100
-    conc = "NGUY CO CAO" if rr > 30 or (spo2s and min(spo2s) < 90) \
-           else "NGUY CO THAP"
+    conc = "NGUY CO CAO" if rr>30 or (spo2s and min(spo2s)<90) else "NGUY CO THAP"
     def _send():
         try:
             r = requests.post(
@@ -203,9 +230,7 @@ def send_report_via_s3(pname: str):
                     "risk_rate":  round(rr, 1),
                     "conclusion": conc,
                     "samples":    len(history)
-                },
-                timeout=10
-            )
+                }, timeout=10)
             ok = r.json().get("status") == "report_sent"
             print(f"Report SMS S3: {'OK' if ok else 'FAIL'}")
         except requests.exceptions.ConnectionError:
@@ -245,11 +270,11 @@ def send_report_email(pname: str):
     temps = [h[3] for h in history if h[3] > 0]
     risks = [h for h in history if h[4] == "RISK"]
     if not hrs or not spo2s: return
-    rr       = len(risks) / len(history) * 100
-    duration = int(history[-1][0] - history[0][0]) if len(history) > 1 else 0
+    rr       = len(risks)/len(history)*100
+    duration = int(history[-1][0]-history[0][0]) if len(history)>1 else 0
     conc     = ("NGUY CO CAO"
-                if rr > 30 or (spo2s and min(spo2s) < 90) or
-                   (temps and sum(temps)/len(temps) >= 38.3)
+                if rr>30 or (spo2s and min(spo2s)<90) or
+                   (temps and sum(temps)/len(temps)>=38.3)
                 else "NGUY CO THAP")
     body = f"""
 ================================================================
@@ -295,31 +320,12 @@ def send_telegram(message: str) -> bool:
     except Exception as e:
         print(f"Telegram error: {e}"); return False
 
-def send_sms(phone: str, message: str) -> bool:
-    if not SPEEDSMS_TOKEN or not phone:
-        print("SpeedSMS chua cau hinh"); return False
-    try:
-        credentials = base64.b64encode(f"{SPEEDSMS_TOKEN}:0".encode()).decode()
-        r = requests.post(
-            "https://api.speedsms.vn/index.php/sms/send",
-            json={"to": [phone], "content": message,
-                  "sms_type": 2, "sender": SPEEDSMS_SENDER},
-            headers={"Authorization": f"Basic {credentials}",
-                     "Content-Type": "application/json"}, timeout=5)
-        return r.json().get("status") == "success"
-    except Exception as e:
-        print(f"SpeedSMS error: {e}"); return False
-
 def notify_all(pname: str, message: str, phone: str = ""):
     def _send():
-        full_msg = (f"SepsisAI Alert\nBenh nhan: {pname}\n"
-                    f"{message}\nThoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
         tele_msg = (f"<b>SepsisAI Alert</b>\nBenh nhan: <b>{pname}</b>\n"
                     f"{message}\nThoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
         send_telegram(tele_msg)
-        target = phone or SPEEDSMS_PHONE
-        if target: send_sms(target, full_msg)
-        send_email(f"SepsisAI Alert - {pname}", full_msg)
+        send_email(f"SepsisAI Alert - {pname}", message)
     threading.Thread(target=_send, daemon=True).start()
 
 # ================================================================
@@ -334,15 +340,15 @@ class SustainedAlert:
         now = time.time()
         if condition:
             if name not in self._timers: self._timers[name] = now
-            if (now - self._timers[name] >= self.confirm_sec and
-                    now - self._last_alert.get(name, 0) >= ALERT_COOLDOWN):
+            if (now-self._timers[name] >= self.confirm_sec and
+                    now-self._last_alert.get(name,0) >= ALERT_COOLDOWN):
                 self._last_alert[name] = now; return True
         else:
             self._timers.pop(name, None)
         return False
 
     def elapsed(self, name):
-        return time.time() - self._timers[name] if name in self._timers else 0.0
+        return time.time()-self._timers[name] if name in self._timers else 0.0
 
     def reset_all(self):
         self._timers.clear(); self._last_alert.clear()
@@ -382,7 +388,7 @@ baseline_engine = PersonalizedBaseline()
 def extract_features(ppg, hr, spo2, temp, baseline):
     sig = np.array(ppg, dtype=float)
     dc  = np.mean(sig) + 1e-6
-    pi  = np.std(sig) / dc * 100
+    pi  = np.std(sig)/dc*100
     pv  = np.std(np.diff(sig))
     peaks, _ = find_peaks(sig, distance=int(SAMPLE_RATE*0.4))
     ptt = np.mean(np.diff(peaks))/SAMPLE_RATE if len(peaks)>=2 else 0.0
@@ -481,12 +487,13 @@ last_temp       = 36.5
 # ================================================================
 root = tk.Tk()
 root.title("SepsisAI Monitor — Professional")
-root.geometry("1200x880")
+root.geometry("1200x900")
 root.configure(bg="#080c14")
 
 BG=  "#080c14"; BG2= "#0f1624"; CARD="#131d2e"
 ACC= "#00e5ff"; ACC2="#ff4d6d"; GREEN="#00ff9f"
 WARN="#ffb703"; TEXT="#e0e8f0"; GRAY="#4a5568"
+PURPLE="#bb86fc"
 
 style = ttk.Style(); style.theme_use("clam")
 for w in ["TLabel","TFrame","TLabelframe","TLabelframe.Label","TCombobox","TEntry"]:
@@ -548,7 +555,7 @@ timer_var  = tk.StringVar(value="")
 make_card(cards_frame, "HEART RATE",  hr_var,     "bpm", ACC)
 make_card(cards_frame, "SpO2",        spo2_var,   "%",   GREEN)
 make_card(cards_frame, "TEMPERATURE", temp_var,   "C",   WARN)
-make_card(cards_frame, "PERF INDEX",  pi_var,     "%",   "#bb86fc")
+make_card(cards_frame, "PERF INDEX",  pi_var,     "%",   PURPLE)
 make_card(cards_frame, "FINGER",      finger_var, "",    GRAY)
 
 ai_card = tk.Frame(cards_frame, bg=CARD)
@@ -565,12 +572,15 @@ tk.Label(ai_card, textvariable=timer_var, font=("Consolas",8,"bold"), bg=CARD, f
 info_frame = tk.Frame(tab_monitor, bg=BG); info_frame.pack(fill="x", padx=10)
 email_to_var = tk.StringVar(value=f"Email: {GMAIL_TO}")
 sms_to_var   = tk.StringVar(value=f"SMS: {SMS_PHONE}")
+s3_ip_var    = tk.StringVar(value=f"S3: {ESP32_S3_IP}")
 tk.Label(info_frame, textvariable=email_to_var,
          font=("Consolas",8), bg=BG, fg=GREEN).pack(side="left", padx=6)
 tk.Label(info_frame, textvariable=sms_to_var,
-         font=("Consolas",8), bg=BG, fg="#bb86fc").pack(side="left", padx=6)
+         font=("Consolas",8), bg=BG, fg=PURPLE).pack(side="left", padx=6)
+tk.Label(info_frame, textvariable=s3_ip_var,
+         font=("Consolas",8), bg=BG, fg=GRAY).pack(side="left", padx=6)
 
-fig = Figure(figsize=(10, 2.5), facecolor=BG2)
+fig = Figure(figsize=(10, 2.4), facecolor=BG2)
 ax  = fig.add_subplot(111)
 ax.set_facecolor(BG2)
 ax.set_title("PPG Waveform - Live", color=TEXT, fontsize=9, pad=4)
@@ -580,18 +590,18 @@ line_ppg, = ax.plot(np.arange(200), ppg_plot, color=ACC, linewidth=1.3, alpha=0.
 canvas = FigureCanvasTkAgg(fig, tab_monitor)
 canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=4)
 
-mb = tk.Frame(tab_monitor, bg=BG); mb.pack(pady=6)
+mb = tk.Frame(tab_monitor, bg=BG); mb.pack(pady=4)
 def btn(parent, text, cmd, color=ACC):
     b = tk.Button(parent, text=text, command=cmd, bg=CARD, fg=color,
-                  font=("Consolas",9,"bold"), relief="flat", padx=12, pady=4,
+                  font=("Consolas",9,"bold"), relief="flat", padx=10, pady=4,
                   activebackground=BG2, activeforeground=color, cursor="hand2")
-    b.pack(side="left", padx=6); return b
+    b.pack(side="left", padx=4); return b
 
 btn(mb, "Xuat Bao Cao",  lambda: export_report())
 btn(mb, "Reset Baseline", lambda: baseline_engine.reset())
 btn(mb, "Xoa History",   lambda: history.clear())
-btn(mb, "Test Email",    lambda: test_email(),    WARN)
-btn(mb, "Test SMS S3",   lambda: test_sms_s3(),   "#bb86fc")
+btn(mb, "Test Email",    lambda: test_email(),  WARN)
+btn(mb, "Test SMS S3",   lambda: test_sms_s3(), PURPLE)
 
 # ── TAB BENH NHAN ────────────────────────────────────────────
 pf = tk.LabelFrame(tab_patients, text=" Them Benh Nhan Moi ",
@@ -690,45 +700,67 @@ def load_history():
 btn(hs_frame, "Tai Lich Su", load_history, ACC)
 
 # ── TAB CAI DAT ──────────────────────────────────────────────
-sf = tk.Frame(tab_settings, bg=BG)
-sf.pack(fill="both", expand=True, padx=20, pady=10)
+# Dùng scrollable frame vì nhiều ô
+sf_outer = tk.Frame(tab_settings, bg=BG)
+sf_outer.pack(fill="both", expand=True)
+sf_canvas = tk.Canvas(sf_outer, bg=BG, highlightthickness=0)
+sf_scroll = ttk.Scrollbar(sf_outer, orient="vertical", command=sf_canvas.yview)
+sf_canvas.configure(yscrollcommand=sf_scroll.set)
+sf_scroll.pack(side="right", fill="y")
+sf_canvas.pack(side="left", fill="both", expand=True)
+sf = tk.Frame(sf_canvas, bg=BG)
+sf_canvas.create_window((0,0), window=sf, anchor="nw")
+sf.bind("<Configure>", lambda e: sf_canvas.configure(
+    scrollregion=sf_canvas.bbox("all")))
 
-tk.Label(sf, text="Cai Dat Thong Bao",
-         font=("Consolas",13,"bold"), bg=BG, fg=ACC).pack(anchor="w", pady=8)
+tk.Label(sf, text="Cai Dat He Thong",
+         font=("Consolas",13,"bold"), bg=BG, fg=ACC).pack(anchor="w", pady=8, padx=20)
 
 cfg_fields = {}
 cfg_cfg = [
-    ("── Telegram ──────",  None,           None),
-    ("Telegram Token",       "tele_token",   TELEGRAM_TOKEN),
-    ("Telegram Chat ID",     "tele_chat",    TELEGRAM_CHAT_ID),
-    ("── Gmail ─────────",  None,           None),
-    ("Gmail Nguoi gui",      "gmail_sender", GMAIL_SENDER),
-    ("Gmail App Password",   "gmail_pass",   GMAIL_PASSWORD),
-    ("Gmail Nguoi nhan",     "gmail_to",     GMAIL_TO),       # ← sửa được
-    ("── SMS qua ESP32-S3 ──", None,         None),
-    ("ESP32-S3 IP",          "s3_ip",        ESP32_S3_IP),
-    ("SDT nhan SMS",         "s3_phone",     SMS_PHONE),      # ← sửa được
-    ("── General ───────",  None,           None),
-    ("Confirm Sec",          "confirm_sec",  str(CONFIRM_SEC)),
+    # Telegram
+    ("── Telegram ──────────────────", None,              None),
+    ("Telegram Token",                 "tele_token",      TELEGRAM_TOKEN),
+    ("Telegram Chat ID",               "tele_chat",       TELEGRAM_CHAT_ID),
+    # Gmail
+    ("── Gmail ──────────────────────", None,             None),
+    ("Gmail Nguoi gui",                "gmail_sender",    GMAIL_SENDER),
+    ("Gmail App Password",             "gmail_pass",      GMAIL_PASSWORD),
+    ("Gmail Nguoi nhan",               "gmail_to",        GMAIL_TO),
+    # SMS Gateway ESP32-S3
+    ("── SMS Gateway (ESP32-S3) ─────", None,            None),
+    ("ESP32-S3 IP",                    "s3_ip",           ESP32_S3_IP),
+    ("SDT nhan SMS",                   "s3_phone",        SMS_PHONE),
+    # WiFi cho ESP32-S3
+    ("── Cau hinh WiFi ESP32-S3 ─────", None,            None),
+    ("WiFi SSID cho S3",               "s3_wifi_ssid",   ""),
+    ("WiFi Password cho S3",           "s3_wifi_pass",   ""),
+    # General
+    ("── General ────────────────────", None,            None),
+    ("Confirm Sec",                    "confirm_sec",    str(CONFIRM_SEC)),
 ]
 
 for lbl, key, default in cfg_cfg:
     if key is None:
         tk.Label(sf, text=lbl, font=("Consolas",8,"bold"),
-                 bg=BG, fg=ACC).pack(anchor="w", pady=(8,2))
+                 bg=BG, fg=ACC).pack(anchor="w", pady=(10,2), padx=20)
         continue
-    r = tk.Frame(sf, bg=BG); r.pack(fill="x", pady=2)
-    tk.Label(r, text=f"{lbl}:", width=22, anchor="w",
+    r = tk.Frame(sf, bg=BG); r.pack(fill="x", pady=2, padx=20)
+    tk.Label(r, text=f"{lbl}:", width=26, anchor="w",
              font=("Consolas",9), bg=BG, fg=GRAY).pack(side="left")
 
-    # Highlight ô sửa được
-    editable = key in ("gmail_to", "s3_phone", "s3_ip")
-    e = tk.Entry(r, width=38, font=("Consolas",10),
+    editable = key in ("gmail_to", "s3_phone", "s3_ip",
+                        "s3_wifi_ssid", "s3_wifi_pass")
+    e = tk.Entry(r, width=34, font=("Consolas",10),
                  bg="#0d2b0d" if editable else CARD,
                  fg=GREEN    if editable else TEXT,
                  insertbackground=GREEN if editable else ACC,
                  relief="flat",
-                 show="*" if "pass" in key.lower() or "token" in key.lower() else "")
+                 show="*" if ("pass" in key.lower() or "token" in key.lower())
+                           and key != "s3_wifi_pass" else "")
+    # WiFi pass cho S3 hiện rõ để dễ nhập
+    if key == "s3_wifi_pass":
+        e.config(show="")
     e.insert(0, default or ""); e.pack(side="left", padx=6)
     cfg_fields[key] = e
 
@@ -756,24 +788,89 @@ def save_settings():
     # Cập nhật info bar
     email_to_var.set(f"Email: {GMAIL_TO}")
     sms_to_var.set(f"SMS: {SMS_PHONE}")
+    s3_ip_var.set(f"S3: {ESP32_S3_IP}")
+
     messagebox.showinfo("OK",
         f"Da luu!\n"
-        f"Email gui den : {GMAIL_TO}\n"
-        f"SMS gui den   : {SMS_PHONE}\n"
-        f"ESP32-S3 IP   : {ESP32_S3_IP}")
+        f"Email  : {GMAIL_TO}\n"
+        f"SMS    : {SMS_PHONE}\n"
+        f"S3 IP  : {ESP32_S3_IP}")
 
-btn_sf = tk.Frame(sf, bg=BG); btn_sf.pack(pady=8)
-btn(btn_sf, "Luu Cai Dat",   save_settings, ACC)
-btn(btn_sf, "Test Telegram",  lambda: threading.Thread(
+def gui_send_wifi_to_s3():
+    """Gui WiFi credentials den ESP32-S3 dang AP mode."""
+    ssid = cfg_fields["s3_wifi_ssid"].get().strip()
+    pwd  = cfg_fields["s3_wifi_pass"].get().strip()
+    if not ssid:
+        messagebox.showwarning("Loi","Nhap ten WiFi SSID truoc"); return
+
+    if not messagebox.askyesno("Xac nhan",
+        f"Gui WiFi den ESP32-S3?\n\n"
+        f"SSID: {ssid}\n\n"
+        f"Dam bao laptop da ket noi WiFi 'SepsisAI_GW' truoc!\n"
+        f"S3 se tu dong khoi dong lai sau khi nhan."): return
+
+    def _send():
+        ok = send_wifi_to_s3(ssid, pwd)
+        if ok:
+            root.after(0, lambda: messagebox.showinfo("OK",
+                f"Da gui WiFi '{ssid}' cho ESP32-S3!\n\n"
+                f"S3 dang khoi dong lai...\n"
+                f"Sau 10 giay:\n"
+                f"1. Ket noi laptop lai WiFi chinh\n"
+                f"2. Mo Serial Monitor S3 → lay IP moi\n"
+                f"3. Dien IP vao o 'ESP32-S3 IP' → Luu Cai Dat"))
+        else:
+            root.after(0, lambda: messagebox.showerror("Loi",
+                "Khong gui duoc!\n\n"
+                "Kiem tra:\n"
+                "1. Laptop phai ket noi WiFi 'SepsisAI_GW'\n"
+                "2. Mat khau: 12345678\n"
+                "3. ESP32-S3 da duoc nap code chua?"))
+    threading.Thread(target=_send, daemon=True).start()
+
+def check_s3_gui():
+    """Kiem tra ket noi ESP32-S3."""
+    def _check():
+        data = check_s3_status()
+        if data:
+            msg = (f"ESP32-S3 ONLINE\n\n"
+                   f"SIM: {'OK' if data.get('sim_ok') else 'FAIL'}\n"
+                   f"Network: {'OK' if data.get('network_ok') else 'FAIL'}\n"
+                   f"Mode: {data.get('wifi_mode','?')}\n"
+                   f"IP: {data.get('ip','?')}\n"
+                   f"WiFi: {data.get('wifi_ssid','?')}\n"
+                   f"Signal: {data.get('signal','?')}")
+            root.after(0, lambda: messagebox.showinfo("S3 Status", msg))
+        else:
+            root.after(0, lambda: messagebox.showerror("Loi",
+                f"Khong ket noi duoc ESP32-S3!\nIP: {ESP32_S3_IP}"))
+    threading.Thread(target=_check, daemon=True).start()
+
+# Buttons settings
+btn_sf = tk.Frame(sf, bg=BG); btn_sf.pack(pady=10, padx=20, anchor="w")
+btn(btn_sf, "Luu Cai Dat",    save_settings,         ACC)
+btn(btn_sf, "Test Email",      lambda: test_email(),  WARN)
+btn(btn_sf, "Test SMS S3",     lambda: test_sms_s3(), PURPLE)
+
+btn_sf2 = tk.Frame(sf, bg=BG); btn_sf2.pack(pady=4, padx=20, anchor="w")
+btn(btn_sf2, "Gui WiFi cho S3", gui_send_wifi_to_s3, GREEN)
+btn(btn_sf2, "Kiem tra S3",     check_s3_gui,         GRAY)
+btn(btn_sf2, "Test Telegram",   lambda: threading.Thread(
     target=lambda: send_telegram("Test tu SepsisAI"), daemon=True).start(), WARN)
-btn(btn_sf, "Test Email",     lambda: test_email(),  WARN)
-btn(btn_sf, "Test SMS S3",    lambda: test_sms_s3(), "#bb86fc")
 
 tk.Label(sf,
-         text=("O mau xanh la: co the sua truc tiep → bam Luu Cai Dat\n"
-               "ESP32-S3 IP: xem tren Serial Monitor cua S3 sau khi nap code\n"
-               "Telegram: @BotFather  |  Gmail: 2FA → App Password"),
-         font=("Consolas",8), bg=BG, fg=GRAY, justify="left").pack(anchor="w", pady=8)
+    text=(
+        "Huong dan cau hinh WiFi cho ESP32-S3:\n"
+        "1. Nap code esp32s3_sim_gateway.ino vao S3\n"
+        "2. Laptop ket noi WiFi 'SepsisAI_GW' / '12345678'\n"
+        "3. Nhap WiFi chinh vao 2 o xanh la → bam 'Gui WiFi cho S3'\n"
+        "4. S3 khoi dong lai → mo Serial Monitor → copy IP\n"
+        "5. Laptop ket noi lai WiFi chinh\n"
+        "6. Dan IP vao o 'ESP32-S3 IP' → bam 'Luu Cai Dat'\n\n"
+        "Gmail: Bat 2FA → App Password → 16 ky tu"
+    ),
+    font=("Consolas",8), bg=BG, fg=GRAY, justify="left"
+).pack(anchor="w", pady=10, padx=20)
 
 # ================================================================
 #  PLOT UPDATE
@@ -842,10 +939,10 @@ def update_gui(finger, hr, spo2, ppg, label, conf, temp):
         if label=="RISK": ai_var.set(f"MOD RISK {conf}%"); ai_label_w.config(fg=WARN)
         else:             ai_var.set(f"NORMAL {conf}%");   ai_label_w.config(fg=GREEN)
 
-    conds = {"spo2_crit":"SpO2 CRIT","sepsis":"Sepsis","tachy":"HR UP",
-             "brady":"HR DOWN","hypo_temp":"Temp LOW","fever":"Fever",
-             "spo2_low":"SpO2 LOW","ai_risk":"AI RISK"}
-    active = [f"{v} {alert_engine.elapsed(k):.0f}s"
+    conds = {"spo2_crit":"SpO2!","sepsis":"Sepsis!","tachy":"HR↑",
+             "brady":"HR↓","hypo_temp":"Temp↓","fever":"Fever",
+             "spo2_low":"SpO2↓","ai_risk":"AI!"}
+    active = [f"{v}{alert_engine.elapsed(k):.0f}s"
               for k,v in conds.items() if alert_engine.elapsed(k)>0]
     timer_var.set("  ".join(active))
 
@@ -859,7 +956,7 @@ def _do_alert(msg, pname, phone, hr=0, spo2=0, temp=0):
     messagebox.showwarning("ALERT", f"Benh nhan: {pname}\n{msg}")
     notify_all(pname, msg, phone)
     send_alert_email(pname, msg)
-    send_alert_via_s3(pname, msg, hr=hr, spo2=spo2, temp=temp)  # ← SMS qua S3
+    send_alert_via_s3(pname, msg, hr=hr, spo2=spo2, temp=temp)
 
 def test_email():
     def _t():
@@ -868,13 +965,14 @@ def test_email():
             f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
         root.after(0, lambda: messagebox.showinfo(
             "OK" if ok else "LOI",
-            f"{'Da gui den: '+GMAIL_TO if ok else 'Gui that bai!'}"))
+            f"{'Da gui den: '+GMAIL_TO if ok else 'Gui that bai! Kiem tra Gmail config'}"))
     threading.Thread(target=_t, daemon=True).start()
 
 def test_sms_s3():
     def _t():
         ok = send_sms_via_s3(SMS_PHONE,
-            f"Test SMS tu SepsisAI\nSDT: {SMS_PHONE}\n"
+            f"Test SMS tu SepsisAI\n"
+            f"SDT: {SMS_PHONE}\n"
             f"S3 IP: {ESP32_S3_IP}\n"
             f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
         root.after(0, lambda: messagebox.showinfo(
@@ -910,8 +1008,8 @@ def disconnect():
 
     if len(history) >= 5:
         pname = current_patient[1] if current_patient else "Khong ro"
-        send_report_email(pname)       # Gmail
-        send_report_via_s3(pname)      # SMS qua ESP32-S3
+        send_report_email(pname)
+        send_report_via_s3(pname)
 
     if current_patient:
         end_session(current_patient[0])
@@ -979,14 +1077,13 @@ Baseline  : HR={baseline_engine.baseline['hr']:.0f} SpO2={baseline_engine.baseli
 -- Chi So Sinh Ton --
 HR   : TB={np.mean(hrs):.1f} Max={np.max(hrs):.1f} Min={np.min(hrs):.1f} bpm
 SpO2 : TB={np.mean(spo2s):.1f}% Min={np.min(spo2s):.1f}%
-Nhiet: TB={np.mean(temps):.1f}C Max={np.max(temps):.1f}C (GY-906)
+Nhiet: TB={np.mean(temps):.1f}C Max={np.max(temps):.1f}C
 
 -- Phan Tich AI --
-Risk Events : {len(risks)} / {len(history)}
+Risk Events : {len(risks)}/{len(history)}
 Risk Rate   : {rr:.1f}%
 
 -- Ket Luan: {conc} --
-
 Chi ho tro lam sang, khong thay the bac si.
 """
     folder = DATA_DIR
