@@ -215,8 +215,16 @@ def send_report_via_s3(pname: str):
     temps = [h[3] for h in history if h[3] > 0]
     risks = [h for h in history if h[4] == "RISK"]
     if not hrs or not spo2s: return
-    rr   = len(risks) / len(history) * 100
-    conc = "NGUY CO CAO" if rr>30 or (spo2s and min(spo2s)<90) else "NGUY CO THAP"
+    rr             = len(risks) / len(history) * 100
+    avg_spo2       = sum(spo2s)/len(spo2s) if spo2s else 99
+    avg_temp       = sum(temps)/len(temps)  if temps else 36.0
+    spo2_low_rate  = sum(1 for s in spo2s if s < 90) / len(spo2s) * 100 if spo2s else 0
+    conc = ("NGUY CO CAO"
+            if rr > 30
+            or spo2_low_rate > 10
+            or avg_spo2 < 90
+            or avg_temp >= 38.3
+            else "NGUY CO THAP")
     def _send():
         try:
             r = requests.post(
@@ -270,12 +278,19 @@ def send_report_email(pname: str):
     temps = [h[3] for h in history if h[3] > 0]
     risks = [h for h in history if h[4] == "RISK"]
     if not hrs or not spo2s: return
-    rr       = len(risks)/len(history)*100
-    duration = int(history[-1][0]-history[0][0]) if len(history)>1 else 0
-    conc     = ("NGUY CO CAO"
-                if rr>30 or (spo2s and min(spo2s)<90) or
-                   (temps and sum(temps)/len(temps)>=38.3)
-                else "NGUY CO THAP")
+    rr             = len(risks)/len(history)*100
+    duration       = int(history[-1][0]-history[0][0]) if len(history)>1 else 0
+    avg_hr         = sum(hrs)/len(hrs)      if hrs   else 0
+    avg_spo2       = sum(spo2s)/len(spo2s) if spo2s else 99
+    avg_temp       = sum(temps)/len(temps)  if temps else 36.0
+    spo2_low_count = sum(1 for s in spo2s if s < 90)
+    spo2_low_rate  = spo2_low_count/len(spo2s)*100 if spo2s else 0
+    conc = ("NGUY CO CAO"
+            if rr > 30
+            or spo2_low_rate > 10
+            or avg_spo2 < 90
+            or avg_temp >= 38.3
+            else "NGUY CO THAP")
     body = f"""
 ================================================================
        SEPSIS AI - BAO CAO DO LUONG TU DONG
@@ -284,9 +299,9 @@ Benh nhan  : {pname}
 Thoi gian  : {datetime.now().strftime('%d/%m/%Y %H:%M')}
 Thoi luong : {duration} giay | So mau: {len(history)}
 -- Chi So Sinh Ton --
-HR    : TB={sum(hrs)/len(hrs):.1f}  Max={max(hrs):.1f}  Min={min(hrs):.1f} bpm
-SpO2  : TB={sum(spo2s)/len(spo2s):.1f}%  Min={min(spo2s):.1f}%
-Nhiet : TB={sum(temps)/len(temps) if temps else 0:.1f}C
+HR    : TB={avg_hr:.1f}  Max={max(hrs):.1f}  Min={min(hrs):.1f} bpm
+SpO2  : TB={avg_spo2:.1f}%  Min={min(spo2s):.1f}%  (< 90%: {spo2_low_count} mau / {spo2_low_rate:.1f}% TG)
+Nhiet : TB={avg_temp:.1f}C
 -- Phan Tich AI --
 Risk Events: {len(risks)}/{len(history)} | Ti le: {rr:.1f}%
 -- Ket Luan: {conc} --
@@ -1060,10 +1075,17 @@ def export_report():
     spo2s = [h[2] for h in history]
     temps = [h[3] for h in history]
     risks = [h for h in history if h[4]=="RISK"]
-    rr    = len(risks)/len(history)*100
-    conc  = ("NGUY CO CAO"
-             if rr>30 or np.min(spo2s)<90 or np.mean(temps)>=38.3
-             else "NGUY CO THAP")
+    rr             = len(risks)/len(history)*100
+    spo2_low_count = sum(1 for s in spo2s if s > 0 and s < 90)
+    spo2_low_rate  = spo2_low_count/len(spo2s)*100 if spo2s else 0
+    avg_spo2       = np.mean([s for s in spo2s if s > 0]) if any(s > 0 for s in spo2s) else 99
+    avg_temp       = np.mean(temps) if temps else 36.0
+    conc = ("NGUY CO CAO"
+            if rr > 30
+            or spo2_low_rate > 10
+            or avg_spo2 < 90
+            or avg_temp >= 38.3
+            else "NGUY CO THAP")
     pinfo = (f"ID:{current_patient[0]} | {current_patient[1]} | SDT:{current_patient[2]}"
              if current_patient else "Khong co ho so")
     report = f"""
@@ -1076,7 +1098,7 @@ Baseline  : HR={baseline_engine.baseline['hr']:.0f} SpO2={baseline_engine.baseli
 
 -- Chi So Sinh Ton --
 HR   : TB={np.mean(hrs):.1f} Max={np.max(hrs):.1f} Min={np.min(hrs):.1f} bpm
-SpO2 : TB={np.mean(spo2s):.1f}% Min={np.min(spo2s):.1f}%
+SpO2 : TB={avg_spo2:.1f}% Min={np.min([s for s in spo2s if s>0] or [0]):.1f}%  (< 90%: {spo2_low_count} mau / {spo2_low_rate:.1f}% TG)
 Nhiet: TB={np.mean(temps):.1f}C Max={np.max(temps):.1f}C
 
 -- Phan Tich AI --
