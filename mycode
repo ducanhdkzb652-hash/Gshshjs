@@ -50,16 +50,22 @@ GMAIL_PASSWORD = "hksv zwlq uegg joad"
 GMAIL_TO       = "lenguyenmanhcuong58@gmail.com"
 
 # ── SMS Gateway qua ESP32-S3 ──────────────
-ESP32_S3_IP   = "192.168.1.xxx"  # ← đổi IP thật sau khi cấu hình WiFi
+ESP32_S3_IP   = "192.168.1.xxx"           # ← đổi IP thật của ESP32-S3
 ESP32_S3_PORT = 80
-SMS_PHONE     = "0901234567"     # ← SĐT nhận SMS
-
-# IP của S3 khi ở AP mode (cố định)
-S3_AP_IP = "192.168.4.1"
+SMS_PHONE     = "0901234567"              # ← SĐT nhận SMS
+S3_API_KEY    = "SepsisAI_S3_2024_XK9!"  # ← phải khớp với ESP32-S3
+S3_AP_IP      = "192.168.4.1"            # IP khi S3 ở AP mode
 
 def _s3_url(path, use_ap=False):
     ip = S3_AP_IP if use_ap else ESP32_S3_IP
     return f"http://{ip}:{ESP32_S3_PORT}{path}"
+
+def _s3_headers():
+    """Header bảo mật — mọi request đến S3 đều phải có."""
+    return {
+        "X-API-Key":    S3_API_KEY,
+        "Content-Type": "application/json"
+    }
 
 # ================= LOAD MODELS =================
 try:
@@ -159,34 +165,54 @@ def send_wifi_to_s3(ssid: str, pwd: str) -> bool:
 def check_s3_status() -> dict:
     """Kiem tra trang thai ESP32-S3."""
     try:
-        r = requests.get(_s3_url("/status"), timeout=3)
+        r = requests.get(_s3_url("/status"),
+                         headers=_s3_headers(), timeout=3)
         return r.json()
     except:
         return {}
 
 
+def _s3_sim_ready() -> bool:
+    """Kiem tra SIM tren ESP32-S3 co san sang khong."""
+    try:
+        r = requests.get(_s3_url("/status"),
+                         headers=_s3_headers(), timeout=4)
+        return r.json().get("sim_ok", False)
+    except:
+        return False
+
+
 def send_sms_via_s3(phone: str, message: str) -> bool:
-    """Gui SMS qua ESP32-S3 gateway."""
+    """Gui SMS qua ESP32-S3 gateway (co API Key bao mat)."""
+    if not ESP32_S3_IP or "xxx" in ESP32_S3_IP:
+        print("SMS S3: Chua cau hinh IP ESP32-S3"); return False
     try:
         r = requests.post(
             _s3_url("/sms"),
             json={"phone": phone, "message": message},
-            timeout=10)
+            headers=_s3_headers(),
+            timeout=25)
+        if r.status_code == 401:
+            print("SMS S3: Thieu API Key!"); return False
+        if r.status_code == 403:
+            print("SMS S3: Sai API Key — kiem tra S3_API_KEY"); return False
         ok = r.json().get("status") == "sent"
         print(f"SMS S3: {'OK' if ok else 'FAIL'} → {phone}")
         return ok
     except requests.exceptions.ConnectionError:
-        print(f"SMS S3: Khong ket noi duoc {ESP32_S3_IP}")
-        return False
+        print(f"SMS S3: Khong ket noi duoc {ESP32_S3_IP}"); return False
+    except requests.exceptions.Timeout:
+        print("SMS S3: Timeout"); return False
     except Exception as e:
-        print(f"SMS S3 error: {e}")
-        return False
+        print(f"SMS S3 error: {e}"); return False
 
 
 def send_alert_via_s3(pname: str, alert_msg: str,
                        hr: float = 0, spo2: float = 0, temp: float = 0):
-    """Gui canh bao SMS qua ESP32-S3 (chay trong thread)."""
+    """Gui canh bao SMS qua ESP32-S3 (co API Key bao mat)."""
     def _send():
+        if not _s3_sim_ready():
+            print("Alert S3: SIM chua san sang, bo qua SMS"); return
         try:
             r = requests.post(
                 _s3_url("/alert"),
@@ -197,11 +223,17 @@ def send_alert_via_s3(pname: str, alert_msg: str,
                     "hr":      int(hr),
                     "spo2":    int(spo2),
                     "temp":    round(float(temp), 1)
-                }, timeout=10)
+                },
+                headers=_s3_headers(),
+                timeout=25)
+            if r.status_code in (401, 403):
+                print("Alert S3: Loi API Key"); return
             ok = r.json().get("status") == "alert_sent"
             print(f"Alert SMS S3: {'OK' if ok else 'FAIL'}")
         except requests.exceptions.ConnectionError:
             print(f"Alert S3: Khong ket noi duoc {ESP32_S3_IP}")
+        except requests.exceptions.Timeout:
+            print("Alert S3: Timeout")
         except Exception as e:
             print(f"Alert S3 error: {e}")
     threading.Thread(target=_send, daemon=True).start()
@@ -238,7 +270,11 @@ def send_report_via_s3(pname: str):
                     "risk_rate":  round(rr, 1),
                     "conclusion": conc,
                     "samples":    len(history)
-                }, timeout=10)
+                },
+                headers=_s3_headers(),
+                timeout=25)
+            if r.status_code in (401, 403):
+                print("Report S3: Loi API Key"); return
             ok = r.json().get("status") == "report_sent"
             print(f"Report SMS S3: {'OK' if ok else 'FAIL'}")
         except requests.exceptions.ConnectionError:
