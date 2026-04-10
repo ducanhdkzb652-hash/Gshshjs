@@ -931,10 +931,13 @@ def _update_plot(ppg_val):
     ppg_plot     = np.roll(ppg_plot, -1)
     ppg_plot[-1] = float(ppg_val)
     line_ppg.set_ydata(ppg_plot)
-    valid = ppg_plot[ppg_plot > 0]
+    # Auto scale chỉ dùng 100 mẫu gần nhất
+    recent = ppg_plot[-100:]
+    valid  = recent[recent > 0]
     if len(valid) > 10:
-        lo,hi = valid.min(), valid.max()
-        ax.set_ylim(lo-(hi-lo)*0.15-1, hi+(hi-lo)*0.15+1)
+        lo, hi = valid.min(), valid.max()
+        margin = max((hi - lo) * 0.2, 500)
+        ax.set_ylim(lo - margin, hi + margin)
     canvas.draw_idle()
 
 # ================================================================
@@ -1020,15 +1023,103 @@ def test_email():
     threading.Thread(target=_t, daemon=True).start()
 
 def test_sms_s3():
+    """Test day du: ket noi → API Key → SIM → gui SMS thuc."""
     def _t():
+        lines = []
+
+        # Bước 1: Kiểm tra IP đã điền chưa
+        if not ESP32_S3_IP or "xxx" in ESP32_S3_IP:
+            root.after(0, lambda: messagebox.showerror("LOI",
+                "Chua dien IP ESP32-S3!\n"
+                "Tab Cai Dat → o 'ESP32-S3 IP' → Luu"))
+            return
+
+        lines.append(f"IP     : {ESP32_S3_IP}")
+        lines.append(f"API Key: {S3_API_KEY[:8]}***")
+        lines.append(f"SDT    : {SMS_PHONE}")
+        lines.append("─" * 30)
+
+        # Bước 2: Ping ESP32-S3
+        try:
+            r = requests.get(_s3_url("/status"),
+                             headers=_s3_headers(), timeout=4)
+
+            if r.status_code == 401:
+                lines.append("❌ API Key: THIEU HEADER")
+                root.after(0, lambda: messagebox.showerror(
+                    "LOI API KEY", "\n".join(lines)))
+                return
+
+            if r.status_code == 403:
+                lines.append("❌ API Key: SAI!")
+                lines.append(f"Key trong Python : {S3_API_KEY}")
+                lines.append("Phai khop voi #define API_KEY trong S3")
+                root.after(0, lambda: messagebox.showerror(
+                    "LOI API KEY", "\n".join(lines)))
+                return
+
+            data = r.json()
+            lines.append(f"✅ Ket noi S3: OK")
+            lines.append(f"✅ API Key   : HOP LE")
+            lines.append(f"   WiFi mode : {data.get('wifi_mode','?')}")
+
+            sim_ok = data.get("sim_ok", False)
+            net_ok = data.get("network_ok", False)
+
+            if not sim_ok:
+                lines.append("❌ SIM: KHONG PHAN HOI")
+                lines.append("→ Kiem tra day noi A7680C")
+                lines.append("→ Bam 'Reset SIM' trong S3")
+                root.after(0, lambda msg="\n".join(lines):
+                    messagebox.showerror("LOI SIM", msg))
+                return
+
+            lines.append(f"✅ SIM A7680C: OK")
+
+            if not net_ok:
+                lines.append("⚠️ Mang 4G: CHUA DANG KY")
+                lines.append("→ Kiem tra SIM co data/credit")
+                lines.append("→ Kiem tra vung phu song")
+                root.after(0, lambda msg="\n".join(lines):
+                    messagebox.showwarning("CANH BAO MANG", msg))
+                return
+
+            lines.append(f"✅ Mang 4G  : OK")
+            lines.append("─" * 30)
+            lines.append("Dang gui SMS test...")
+
+        except requests.exceptions.ConnectionError:
+            lines.append(f"❌ Khong ket noi duoc {ESP32_S3_IP}")
+            lines.append("→ Kiem tra ESP32-S3 da bat chua")
+            lines.append("→ Kiem tra cung mang WiFi")
+            root.after(0, lambda msg="\n".join(lines):
+                messagebox.showerror("LOI KET NOI", msg))
+            return
+        except requests.exceptions.Timeout:
+            lines.append("❌ Timeout — ESP32-S3 khong phan hoi")
+            root.after(0, lambda msg="\n".join(lines):
+                messagebox.showerror("TIMEOUT", msg))
+            return
+        except Exception as e:
+            lines.append(f"❌ Loi: {e}")
+            root.after(0, lambda msg="\n".join(lines):
+                messagebox.showerror("LOI", msg))
+            return
+
+        # Bước 3: Gửi SMS thực
         ok = send_sms_via_s3(SMS_PHONE,
-            f"Test SMS tu SepsisAI\n"
-            f"SDT: {SMS_PHONE}\n"
-            f"S3 IP: {ESP32_S3_IP}\n"
+            f"SepsisAI Test SMS\n"
+            f"IP: {ESP32_S3_IP}\n"
+            f"API Key: OK\n"
+            f"SIM: OK\n"
             f"Thoi gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}")
-        root.after(0, lambda: messagebox.showinfo(
-            "OK" if ok else "LOI",
-            f"{'SMS da gui den: '+SMS_PHONE if ok else 'Gui that bai! Kiem tra IP ESP32-S3'}"))
+
+        lines.append("✅ SMS: GUI THANH CONG!" if ok else "❌ SMS: GUI THAT BAI!")
+        title  = "TEST THANH CONG" if ok else "GUI SMS THAT BAI"
+        method = messagebox.showinfo if ok else messagebox.showerror
+        root.after(0, lambda msg="\n".join(lines), t=title, m=method:
+            m(t, msg))
+
     threading.Thread(target=_t, daemon=True).start()
 
 # ================================================================
@@ -1073,8 +1164,18 @@ def read_serial():
             raw = ser.readline().decode(errors="ignore").strip()
             if not raw: continue
             pkt = json.loads(raw)
+
+            # ── Packet PPG nhanh {"p": rawIR} ────────
+            if "p" in pkt and len(pkt) == 1:
+                ppg = float(pkt["p"])
+                if ppg > 1000:
+                    root.after(0, lambda p=ppg: _update_plot(p))
+                continue
+
+            # ── Bỏ qua event packet ───────────────────
             if "event" in pkt: continue
 
+            # ── Packet đầy đủ ─────────────────────────
             finger = pkt.get("finger", False)
             hr     = float(pkt.get("hr",   0))
             spo2   = float(pkt.get("spo2", 0))
