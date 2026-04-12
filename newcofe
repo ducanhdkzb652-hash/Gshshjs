@@ -56,7 +56,7 @@ except ImportError:
 BAUDRATE       = 115200
 WINDOW         = 100
 SAMPLE_RATE    = 100
-CONFIRM_SEC    = 4
+CONFIRM_SEC    = 10          # ← sửa 4 -> 10 giây
 ALERT_COOLDOWN = 30
 DB_PATH        = "sepsis_patients.db"
 DATA_DIR       = Path("patient_data"); DATA_DIR.mkdir(exist_ok=True)
@@ -174,13 +174,15 @@ def send_report_via_s3(pname):
     temps=[h[3] for h in history if h[3]>0]; risks=[h for h in history if h[4]=="RISK"]
     if not hrs or not spo2s: return
     rr = len(risks)/len(history)*100
-    conc = "NGUY CO CAO" if rr>30 or (spo2s and min(spo2s)<90) else "NGUY CO THAP"
+    avg_spo2 = sum(spo2s)/len(spo2s)
+    avg_temp = sum(temps)/len(temps) if temps else 0
+    conc = "NGUY CO CAO" if rr>30 or avg_spo2<94 or avg_temp>=38.3 else "NGUY CO THAP"  # ← sửa
     def _send():
         try:
             requests.post(_s3_url("/report"),
                 json={"phone": SMS_PHONE, "patient": pname,
-                      "hr": round(sum(hrs)/len(hrs),1), "spo2": round(sum(spo2s)/len(spo2s),1),
-                      "temp": round(sum(temps)/len(temps) if temps else 0,1),
+                      "hr": round(sum(hrs)/len(hrs),1), "spo2": round(avg_spo2,1),
+                      "temp": round(avg_temp,1),
                       "risk_rate": round(rr,1), "conclusion": conc, "samples": len(history)},
                 timeout=25)
         except Exception as e: print(f"Report S3 error: {e}")
@@ -207,10 +209,12 @@ def send_report_email(pname):
     temps=[h[3] for h in history if h[3]>0]; risks=[h for h in history if h[4]=="RISK"]
     if not hrs or not spo2s: return
     rr=len(risks)/len(history)*100
-    conc="NGUY CO CAO" if rr>30 or (spo2s and min(spo2s)<90) else "NGUY CO THAP"
+    avg_spo2 = sum(spo2s)/len(spo2s)
+    avg_temp = sum(temps)/len(temps) if temps else 0
+    conc = "NGUY CO CAO" if rr>30 or avg_spo2<94 or avg_temp>=38.3 else "NGUY CO THAP"  # ← sửa
     body=(f"SEPSIS AI - BAO CAO\nBenh nhan: {pname}\n"
-          f"HR: {sum(hrs)/len(hrs):.1f} bpm\nSpO2: {sum(spo2s)/len(spo2s):.1f}%\n"
-          f"Nhiet: {sum(temps)/len(temps) if temps else 0:.1f}C\n"
+          f"HR: {sum(hrs)/len(hrs):.1f} bpm\nSpO2: {avg_spo2:.1f}%\n"
+          f"Nhiet: {avg_temp:.1f}C\n"
           f"Risk: {rr:.1f}%\nKet luan: {conc}")
     subject=f"SepsisAI Bao Cao | {pname} | {datetime.now().strftime('%d/%m/%Y %H:%M')}"
     threading.Thread(target=lambda: _send_email_core(GMAIL_TO,subject,body), daemon=True).start()
@@ -423,6 +427,7 @@ async def _ble_task():
         if len(history)>=5:
             pname=current_patient[1] if current_patient else "Khong ro"
             send_report_email(pname); send_report_via_s3(pname)
+            root.after(0, show_report_window)   # ← thêm popup báo cáo
         if current_patient: end_session(current_patient[0]); refresh_hs_combo()
 
 def _ble_thread():
@@ -513,7 +518,7 @@ ttk.Button(ctrl,text="Stop USB",command=lambda: disconnect_serial()).pack(side="
 # Divider
 tk.Label(ctrl,text=" | ",font=("Consolas",12),bg=BG,fg=GRAY).pack(side="left",padx=6)
 
-# BLE button — nổi bật màu xanh lá
+# BLE button
 ble_btn=tk.Button(ctrl,text="Ket noi Bluetooth",
     command=connect_ble,bg=CARD,fg=GREEN,
     font=("Consolas",9,"bold"),relief="flat",
@@ -864,6 +869,7 @@ def disconnect_serial():
     if len(history)>=5:
         pname=current_patient[1] if current_patient else "Khong ro"
         send_report_email(pname); send_report_via_s3(pname)
+        root.after(300, show_report_window)     # ← thêm popup báo cáo
     if current_patient: end_session(current_patient[0]); refresh_hs_combo()
 
 def _serial_loop():
@@ -874,7 +880,7 @@ def _serial_loop():
         except Exception as e: print("USB ERR:",e)
 
 # ================================================================
-#  EXPORT REPORT
+#  EXPORT REPORT (lưu file .txt)
 # ================================================================
 def export_report():
     if len(history)<10: messagebox.showwarning("","Can it nhat 10 mau"); return
@@ -883,7 +889,7 @@ def export_report():
     rr=len(risks)/len(history)*100
     avg_hr=np.mean(hrs) if hrs else 0; avg_spo2=np.mean(spo2s) if spo2s else 0
     avg_temp=np.mean(temps) if temps else 0
-    conc="NGUY CO CAO" if rr>30 or (spo2s and np.min(spo2s)<90) or avg_temp>=38.3 else "NGUY CO THAP"
+    conc="NGUY CO CAO" if rr>30 or avg_spo2<94 or avg_temp>=38.3 else "NGUY CO THAP"  # ← sửa
     pinfo=(f"ID:{current_patient[0]} | {current_patient[1]}" if current_patient else "Khong co ho so")
     duration=int(history[-1][0]-history[0][0]) if len(history)>1 else 0
     report=(f"AI SEPSIS - BAO CAO\n{'='*40}\n"
@@ -901,6 +907,81 @@ def export_report():
     path=folder/f"BaoCao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(path,"w",encoding="utf-8-sig") as f: f.write(report)
     messagebox.showinfo("OK",f"Da luu: {path}")
+
+# ================================================================
+#  POPUP BÁO CÁO SAU KHI KẾT THÚC ĐO
+# ================================================================
+def show_report_window():
+    if len(history) < 5: return
+    hrs   = [h[1] for h in history if h[1]>0]
+    spo2s = [h[2] for h in history if h[2]>0]
+    temps = [h[3] for h in history if h[3]>0]
+    risks = [h for h in history if h[4]=="RISK"]
+    if not hrs or not spo2s: return
+
+    rr       = len(risks)/len(history)*100
+    avg_hr   = sum(hrs)/len(hrs)
+    avg_spo2 = sum(spo2s)/len(spo2s)
+    avg_temp = sum(temps)/len(temps) if temps else 0
+    min_spo2 = min(spo2s)
+    max_hr   = max(hrs)
+    min_hr   = min(hrs)
+    duration = int(history[-1][0]-history[0][0]) if len(history)>1 else 0
+    conc     = "NGUY CO CAO" if rr>30 or avg_spo2<94 or avg_temp>=38.3 else "NGUY CO THAP"
+    pname    = current_patient[1] if current_patient else "Khong ro"
+
+    win = tk.Toplevel(root)
+    win.title("Bao Cao Ket Qua Do")
+    win.geometry("480x560")
+    win.configure(bg=BG)
+    win.grab_set()  # modal - khóa cửa sổ chính
+
+    # Tiêu đề
+    tk.Label(win, text="BAO CAO KET QUA DO",
+             font=("Consolas",14,"bold"), bg=BG, fg=ACC).pack(pady=(16,4))
+    tk.Frame(win, bg=ACC, height=2).pack(fill="x", padx=20)
+
+    info_frame = tk.Frame(win, bg=BG)
+    info_frame.pack(fill="x", padx=24, pady=12)
+
+    def row(label, value, color=TEXT):
+        r = tk.Frame(info_frame, bg=BG); r.pack(fill="x", pady=3)
+        tk.Label(r, text=f"{label:<22}", font=("Consolas",10),
+                 bg=BG, fg=GRAY).pack(side="left")
+        tk.Label(r, text=value, font=("Consolas",10,"bold"),
+                 bg=BG, fg=color).pack(side="left")
+
+    row("Benh nhan",    pname,                                   ACC)
+    row("Thoi luong",   f"{duration//60}p {duration%60}s")
+    row("So mau",       str(len(history)))
+    tk.Frame(info_frame, bg=GRAY, height=1).pack(fill="x", pady=6)
+    row("Nhip tim TB",  f"{avg_hr:.1f} bpm",                    ACC)
+    row("  Max / Min",  f"{max_hr:.0f} / {min_hr:.0f} bpm")
+    row("SpO2 TB",      f"{avg_spo2:.1f}%",                     GREEN)
+    row("  SpO2 Min",   f"{min_spo2:.1f}%",
+        ACC2 if min_spo2<94 else TEXT)
+    row("Nhiet do TB",  f"{avg_temp:.1f} °C",                   WARN)
+    row("Ty le RISK",   f"{rr:.1f}%",
+        ACC2 if rr>30 else GREEN)
+    tk.Frame(info_frame, bg=GRAY, height=1).pack(fill="x", pady=6)
+
+    # Kết luận
+    conc_color = ACC2 if conc == "NGUY CO CAO" else GREEN
+    tk.Label(win, text=f"KET LUAN:  {conc}",
+             font=("Consolas",13,"bold"), bg=BG, fg=conc_color).pack(pady=8)
+
+    if conc == "NGUY CO CAO":
+        tk.Label(win, text="⚠  De nghi theo doi va tu van bac si",
+                 font=("Consolas",9), bg=BG, fg=WARN).pack()
+
+    # Nút hành động
+    btn_row = tk.Frame(win, bg=BG); btn_row.pack(pady=16)
+    tk.Button(btn_row, text="Xuat File .txt", command=export_report,
+              bg=CARD, fg=ACC, font=("Consolas",9,"bold"),
+              relief="flat", padx=12, pady=4, cursor="hand2").pack(side="left", padx=8)
+    tk.Button(btn_row, text="Dong", command=win.destroy,
+              bg=CARD, fg=GRAY, font=("Consolas",9,"bold"),
+              relief="flat", padx=12, pady=4, cursor="hand2").pack(side="left", padx=8)
 
 # ================================================================
 #  RUN
