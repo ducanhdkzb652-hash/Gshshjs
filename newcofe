@@ -170,20 +170,17 @@ def send_alert_via_s3(pname, alert_msg, hr=0, spo2=0, temp=0):
 
 def send_report_via_s3(pname):
     if len(history) < 5: return
-    hrs=[h[1] for h in history if h[1]>0]; spo2s=[h[2] for h in history if h[2]>0]
-    temps=[h[3] for h in history if h[3]>0]; risks=[h for h in history if h[4]=="RISK"]
-    if not hrs or not spo2s: return
-    rr = len(risks)/len(history)*100
-    avg_spo2 = sum(spo2s)/len(spo2s)
-    avg_temp = sum(temps)/len(temps) if temps else 0
-    conc = "NGUY CO CAO" if rr>30 or avg_spo2<94 or avg_temp>=38.3 else "NGUY CO THAP"  # ← sửa
+    s = _calc_report_stats()
+    if not s['hrs'] or not s['spo2s']: return
     def _send():
         try:
             requests.post(_s3_url("/report"),
                 json={"phone": SMS_PHONE, "patient": pname,
-                      "hr": round(sum(hrs)/len(hrs),1), "spo2": round(avg_spo2,1),
-                      "temp": round(avg_temp,1),
-                      "risk_rate": round(rr,1), "conclusion": conc, "samples": len(history)},
+                      "hr": round(s['avg_hr'],1), "spo2": round(s['avg_spo2'],1),
+                      "temp": round(s['avg_temp'],1),
+                      "risk_rate": round(s['rr'],1),
+                      "avg_conf_risk": round(s['avg_conf_risk'],1),
+                      "conclusion": s['conc'], "samples": s['n_total']},
                 timeout=25)
         except Exception as e: print(f"Report S3 error: {e}")
     threading.Thread(target=_send, daemon=True).start()
@@ -205,18 +202,18 @@ def _send_email_core(to, subject, body):
 
 def send_report_email(pname):
     if len(history) < 5: return
-    hrs=[h[1] for h in history if h[1]>0]; spo2s=[h[2] for h in history if h[2]>0]
-    temps=[h[3] for h in history if h[3]>0]; risks=[h for h in history if h[4]=="RISK"]
-    if not hrs or not spo2s: return
-    rr=len(risks)/len(history)*100
-    avg_spo2 = sum(spo2s)/len(spo2s)
-    avg_temp = sum(temps)/len(temps) if temps else 0
-    conc = "NGUY CO CAO" if rr>30 or avg_spo2<94 or avg_temp>=38.3 else "NGUY CO THAP"  # ← sửa
-    body=(f"SEPSIS AI - BAO CAO\nBenh nhan: {pname}\n"
-          f"HR: {sum(hrs)/len(hrs):.1f} bpm\nSpO2: {avg_spo2:.1f}%\n"
-          f"Nhiet: {avg_temp:.1f}C\n"
-          f"Risk: {rr:.1f}%\nKet luan: {conc}")
-    subject=f"SepsisAI Bao Cao | {pname} | {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    s = _calc_report_stats()
+    if not s['hrs'] or not s['spo2s']: return
+    body = (f"SEPSIS AI - BAO CAO\nBenh nhan: {pname}\n"
+            f"Mo hinh AI: {s['model_str']}\n\n"
+            f"HR: {s['avg_hr']:.1f} bpm  |  SpO2: {s['avg_spo2']:.1f}%  |  Nhiet: {s['avg_temp']:.1f}C\n\n"
+            f"--- DANH GIA AI ---\n"
+            f"Ty le RISK     : {s['rr']:.1f}% ({s['n_risk']}/{s['n_total']} mau)\n"
+            f"Conf TB RISK   : {s['avg_conf_risk']:.1f}%\n"
+            f"AI canh bao    : {'CO' if s['ai_high'] else 'KHONG'}\n"
+            f"Lam sang       : {'BAT THUONG' if s['clin_high'] else 'BINH THUONG'}\n\n"
+            f"KET LUAN: {s['conc']}")
+    subject = f"SepsisAI Bao Cao | {pname} | {datetime.now().strftime('%d/%m/%Y %H:%M')}"
     threading.Thread(target=lambda: _send_email_core(GMAIL_TO,subject,body), daemon=True).start()
 
 def send_alert_email(pname, msg):
@@ -880,31 +877,89 @@ def _serial_loop():
         except Exception as e: print("USB ERR:",e)
 
 # ================================================================
+#  HELPER: tính thống kê báo cáo dựa trên AI output
+# ================================================================
+def _calc_report_stats():
+    """Tính toàn bộ chỉ số từ history, kết luận ưu tiên AI."""
+    hrs   = [h[1] for h in history if h[1]>0]
+    spo2s = [h[2] for h in history if h[2]>0]
+    temps = [h[3] for h in history if h[3]>0]
+    confs = [h[5] for h in history]                        # confidence 0-100
+    risk_samples  = [h for h in history if h[4]=="RISK"]
+    risk_confs    = [h[5] for h in risk_samples]
+
+    rr           = len(risk_samples)/len(history)*100 if history else 0
+    avg_conf      = sum(confs)/len(confs) if confs else 0
+    avg_conf_risk = sum(risk_confs)/len(risk_confs) if risk_confs else 0
+    avg_hr    = sum(hrs)/len(hrs)       if hrs   else 0
+    avg_spo2  = sum(spo2s)/len(spo2s)  if spo2s else 0
+    avg_temp  = sum(temps)/len(temps)  if temps  else 0
+    min_spo2  = min(spo2s) if spo2s else 0
+    max_hr    = max(hrs)   if hrs   else 0
+    min_hr    = min(hrs)   if hrs   else 0
+
+    # Kết luận: ưu tiên AI score, clinical chỉ là hỗ trợ
+    ai_high   = rr > 30 or avg_conf_risk > 70
+    clin_high = avg_spo2 < 94 or avg_temp >= 38.3
+    if ai_high and clin_high:
+        conc = "NGUY CO CAO (AI + Lam sang)"
+    elif ai_high:
+        conc = "NGUY CO CAO (AI)"
+    elif clin_high:
+        conc = "NGUY CO TRUNG BINH (Lam sang)"
+    else:
+        conc = "NGUY CO THAP"
+
+    model_info = []
+    if dl_model:  model_info.append("CNN-BiLSTM")
+    if xgb_model: model_info.append("XGBoost")
+    model_str = " + ".join(model_info) if model_info else "Rule-based (no model)"
+
+    duration = int(history[-1][0]-history[0][0]) if len(history)>1 else 0
+
+    return dict(
+        hrs=hrs, spo2s=spo2s, temps=temps,
+        rr=rr, avg_conf=avg_conf, avg_conf_risk=avg_conf_risk,
+        avg_hr=avg_hr, avg_spo2=avg_spo2, avg_temp=avg_temp,
+        min_spo2=min_spo2, max_hr=max_hr, min_hr=min_hr,
+        n_risk=len(risk_samples), n_total=len(history),
+        conc=conc, model_str=model_str, duration=duration,
+        ai_high=ai_high, clin_high=clin_high,
+    )
+
+# ================================================================
 #  EXPORT REPORT (lưu file .txt)
 # ================================================================
 def export_report():
     if len(history)<10: messagebox.showwarning("","Can it nhat 10 mau"); return
-    hrs=[h[1] for h in history if h[1]>0]; spo2s=[h[2] for h in history if h[2]>0]
-    temps=[h[3] for h in history if h[3]>0]; risks=[h for h in history if h[4]=="RISK"]
-    rr=len(risks)/len(history)*100
-    avg_hr=np.mean(hrs) if hrs else 0; avg_spo2=np.mean(spo2s) if spo2s else 0
-    avg_temp=np.mean(temps) if temps else 0
-    conc="NGUY CO CAO" if rr>30 or avg_spo2<94 or avg_temp>=38.3 else "NGUY CO THAP"  # ← sửa
-    pinfo=(f"ID:{current_patient[0]} | {current_patient[1]}" if current_patient else "Khong co ho so")
-    duration=int(history[-1][0]-history[0][0]) if len(history)>1 else 0
-    report=(f"AI SEPSIS - BAO CAO\n{'='*40}\n"
-            f"Ngay: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
-            f"Benh nhan: {pinfo}\nKet noi: {conn_mode_var.get()}\n"
-            f"So mau: {len(history)} | Thoi luong: {duration//60}p{duration%60}s\n\n"
-            f"HR  : {avg_hr:.1f} bpm (Max:{max(hrs) if hrs else 0:.1f} Min:{min(hrs) if hrs else 0:.1f})\n"
-            f"SpO2: {avg_spo2:.1f}% (Min:{min(spo2s) if spo2s else 0:.1f}%)\n"
-            f"Nhiet: {avg_temp:.1f}C\nRisk: {rr:.1f}%\n\n"
-            f"KET LUAN: {conc}\nCap cuu: 115\n")
-    folder=DATA_DIR
+    s = _calc_report_stats()
+    pinfo = (f"ID:{current_patient[0]} | {current_patient[1]}" if current_patient else "Khong co ho so")
+    report = (
+        f"AI SEPSIS - BAO CAO\n{'='*40}\n"
+        f"Ngay      : {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+        f"Benh nhan : {pinfo}\n"
+        f"Ket noi   : {conn_mode_var.get()}\n"
+        f"Mo hinh AI: {s['model_str']}\n"
+        f"So mau    : {s['n_total']} | Thoi luong: {s['duration']//60}p{s['duration']%60}s\n"
+        f"\n--- CHI SO LAM SANG ---\n"
+        f"HR    : {s['avg_hr']:.1f} bpm  (Max:{s['max_hr']:.0f}  Min:{s['min_hr']:.0f})\n"
+        f"SpO2  : {s['avg_spo2']:.1f}%   (Min:{s['min_spo2']:.1f}%)\n"
+        f"Nhiet : {s['avg_temp']:.1f} C\n"
+        f"\n--- DANH GIA AI ---\n"
+        f"Ty le mau RISK      : {s['rr']:.1f}%  ({s['n_risk']}/{s['n_total']} mau)\n"
+        f"Conf TB toan phien  : {s['avg_conf']:.1f}%\n"
+        f"Conf TB mau RISK    : {s['avg_conf_risk']:.1f}%\n"
+        f"AI canh bao         : {'CO' if s['ai_high'] else 'KHONG'}\n"
+        f"Lam sang bat thuong : {'CO' if s['clin_high'] else 'KHONG'}\n"
+        f"\n{'='*40}\n"
+        f"KET LUAN: {s['conc']}\n"
+        f"Cap cuu : 115\n"
+    )
+    folder = DATA_DIR
     if current_patient:
-        safe="".join(c for c in current_patient[1] if c.isalnum() or c in " _-")
-        folder=DATA_DIR/f"P{current_patient[0]:04d}_{safe}"; folder.mkdir(exist_ok=True)
-    path=folder/f"BaoCao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        safe = "".join(c for c in current_patient[1] if c.isalnum() or c in " _-")
+        folder = DATA_DIR/f"P{current_patient[0]:04d}_{safe}"; folder.mkdir(exist_ok=True)
+    path = folder/f"BaoCao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(path,"w",encoding="utf-8-sig") as f: f.write(report)
     messagebox.showinfo("OK",f"Da luu: {path}")
 
@@ -913,69 +968,78 @@ def export_report():
 # ================================================================
 def show_report_window():
     if len(history) < 5: return
-    hrs   = [h[1] for h in history if h[1]>0]
-    spo2s = [h[2] for h in history if h[2]>0]
-    temps = [h[3] for h in history if h[3]>0]
-    risks = [h for h in history if h[4]=="RISK"]
-    if not hrs or not spo2s: return
-
-    rr       = len(risks)/len(history)*100
-    avg_hr   = sum(hrs)/len(hrs)
-    avg_spo2 = sum(spo2s)/len(spo2s)
-    avg_temp = sum(temps)/len(temps) if temps else 0
-    min_spo2 = min(spo2s)
-    max_hr   = max(hrs)
-    min_hr   = min(hrs)
-    duration = int(history[-1][0]-history[0][0]) if len(history)>1 else 0
-    conc     = "NGUY CO CAO" if rr>30 or avg_spo2<94 or avg_temp>=38.3 else "NGUY CO THAP"
-    pname    = current_patient[1] if current_patient else "Khong ro"
+    s = _calc_report_stats()
+    if not s['hrs'] or not s['spo2s']: return
+    pname = current_patient[1] if current_patient else "Khong ro"
 
     win = tk.Toplevel(root)
     win.title("Bao Cao Ket Qua Do")
-    win.geometry("480x560")
+    win.geometry("500x640")
     win.configure(bg=BG)
-    win.grab_set()  # modal - khóa cửa sổ chính
+    win.grab_set()
 
     # Tiêu đề
     tk.Label(win, text="BAO CAO KET QUA DO",
-             font=("Consolas",14,"bold"), bg=BG, fg=ACC).pack(pady=(16,4))
-    tk.Frame(win, bg=ACC, height=2).pack(fill="x", padx=20)
+             font=("Consolas",14,"bold"), bg=BG, fg=ACC).pack(pady=(16,2))
+    tk.Label(win, text=f"Mo hinh: {s['model_str']}",
+             font=("Consolas",8), bg=BG, fg=PURPLE).pack()
+    tk.Frame(win, bg=ACC, height=2).pack(fill="x", padx=20, pady=(6,0))
 
     info_frame = tk.Frame(win, bg=BG)
-    info_frame.pack(fill="x", padx=24, pady=12)
+    info_frame.pack(fill="x", padx=24, pady=8)
 
     def row(label, value, color=TEXT):
-        r = tk.Frame(info_frame, bg=BG); r.pack(fill="x", pady=3)
-        tk.Label(r, text=f"{label:<22}", font=("Consolas",10),
+        r = tk.Frame(info_frame, bg=BG); r.pack(fill="x", pady=2)
+        tk.Label(r, text=f"{label:<24}", font=("Consolas",9),
                  bg=BG, fg=GRAY).pack(side="left")
         tk.Label(r, text=value, font=("Consolas",10,"bold"),
                  bg=BG, fg=color).pack(side="left")
 
+    def section(title):
+        tk.Frame(info_frame, bg=GRAY, height=1).pack(fill="x", pady=(8,4))
+        tk.Label(info_frame, text=title, font=("Consolas",8,"bold"),
+                 bg=BG, fg=ACC).pack(anchor="w")
+
     row("Benh nhan",    pname,                                   ACC)
-    row("Thoi luong",   f"{duration//60}p {duration%60}s")
-    row("So mau",       str(len(history)))
-    tk.Frame(info_frame, bg=GRAY, height=1).pack(fill="x", pady=6)
-    row("Nhip tim TB",  f"{avg_hr:.1f} bpm",                    ACC)
-    row("  Max / Min",  f"{max_hr:.0f} / {min_hr:.0f} bpm")
-    row("SpO2 TB",      f"{avg_spo2:.1f}%",                     GREEN)
-    row("  SpO2 Min",   f"{min_spo2:.1f}%",
-        ACC2 if min_spo2<94 else TEXT)
-    row("Nhiet do TB",  f"{avg_temp:.1f} °C",                   WARN)
-    row("Ty le RISK",   f"{rr:.1f}%",
-        ACC2 if rr>30 else GREEN)
-    tk.Frame(info_frame, bg=GRAY, height=1).pack(fill="x", pady=6)
+    row("Thoi luong",   f"{s['duration']//60}p {s['duration']%60}s")
+    row("So mau",       str(s['n_total']))
+
+    section("CHI SO LAM SANG")
+    row("Nhip tim TB",  f"{s['avg_hr']:.1f} bpm",               ACC)
+    row("  Max / Min",  f"{s['max_hr']:.0f} / {s['min_hr']:.0f} bpm")
+    row("SpO2 TB",      f"{s['avg_spo2']:.1f}%",                GREEN)
+    row("  SpO2 Min",   f"{s['min_spo2']:.1f}%",
+        ACC2 if s['min_spo2']<94 else TEXT)
+    row("Nhiet do TB",  f"{s['avg_temp']:.1f} °C",              WARN)
+    row("Bat thuong LS","CO" if s['clin_high'] else "KHONG",
+        ACC2 if s['clin_high'] else GREEN)
+
+    section("DANH GIA AI")
+    row("Ty le mau RISK",
+        f"{s['rr']:.1f}%  ({s['n_risk']}/{s['n_total']} mau)",
+        ACC2 if s['rr']>30 else GREEN)
+    row("Conf TB toan phien", f"{s['avg_conf']:.1f}%")
+    row("Conf TB mau RISK",
+        f"{s['avg_conf_risk']:.1f}%",
+        ACC2 if s['avg_conf_risk']>70 else WARN if s['avg_conf_risk']>50 else GREEN)
+    row("AI canh bao",  "CO" if s['ai_high'] else "KHONG",
+        ACC2 if s['ai_high'] else GREEN)
 
     # Kết luận
-    conc_color = ACC2 if conc == "NGUY CO CAO" else GREEN
-    tk.Label(win, text=f"KET LUAN:  {conc}",
-             font=("Consolas",13,"bold"), bg=BG, fg=conc_color).pack(pady=8)
+    tk.Frame(info_frame, bg=ACC2 if "CAO" in s['conc'] else GREEN,
+             height=2).pack(fill="x", pady=(10,4))
+    conc_color = ACC2 if "CAO" in s['conc'] else (WARN if "TRUNG BINH" in s['conc'] else GREEN)
+    tk.Label(win, text=f"KET LUAN:  {s['conc']}",
+             font=("Consolas",11,"bold"), bg=BG, fg=conc_color).pack(pady=4)
 
-    if conc == "NGUY CO CAO":
+    if "CAO" in s['conc']:
         tk.Label(win, text="⚠  De nghi theo doi va tu van bac si",
                  font=("Consolas",9), bg=BG, fg=WARN).pack()
+    elif "TRUNG BINH" in s['conc']:
+        tk.Label(win, text="ℹ  Chi so lam sang can theo doi them",
+                 font=("Consolas",9), bg=BG, fg=WARN).pack()
 
-    # Nút hành động
-    btn_row = tk.Frame(win, bg=BG); btn_row.pack(pady=16)
+    btn_row = tk.Frame(win, bg=BG); btn_row.pack(pady=14)
     tk.Button(btn_row, text="Xuat File .txt", command=export_report,
               bg=CARD, fg=ACC, font=("Consolas",9,"bold"),
               relief="flat", padx=12, pady=4, cursor="hand2").pack(side="left", padx=8)
