@@ -22,6 +22,8 @@
 #define TFT_MOSI  6
 #define TFT_SCK   4
 #define TFT_BL    10
+// ── NÚT GY-906 ──────────────────────────────────
+#define BTN_TEMP_PIN   5      // GPIO còn trống trên C3 Mini
 
 // ════════════════════════════════════════════════
 //  BLE UUID
@@ -81,11 +83,18 @@ int   goodCount      = 0;
 bool  fingerDetected = false;
 float tempC          = 36.0f;
 bool  mlxOK          = false;
-
+int  displayHR        = 0;
+int  displaySPO2      = 0;
+bool hrInited         = false;
+bool spo2Inited       = false;
+int  spo2DriftSamples = 0;
 int16_t  waveBuffer[WAVE_LEN];
 uint8_t  waveIdx   = 0;
 uint8_t  ppgCount  = 0;
 volatile long lastRawIR = 0;
+// Trong phần SENSOR VARS, thêm:
+bool    tempMeasuring  = true;   // true = đang đo, false = giữ giá trị
+bool    prevTempMode   = true;   // cache để cập nhật TFT
 
 // ════════════════════════════════════════════════
 //  CACHE TFT
@@ -262,6 +271,21 @@ void updateTemp(float t) {
   tft.setCursor(224, VAL_Y);
   tft.print(String(t, 1));
 }
+void updateTempLabel(bool measuring) {
+  if (measuring == prevTempMode) return;
+  prevTempMode = measuring;
+  // Xóa vùng label card Temp
+  tft.fillRect(220, CARD_Y + 1, 94, 12, C_BG);
+  tft.setTextSize(1);
+  if (measuring) {
+    tft.setTextColor(C_GRAY);
+    tft.setCursor(224, CARD_Y + 4); tft.print("TEMP");
+  } else {
+    // Hiện "TEMP [H]" màu vàng khi đang hold
+    tft.setTextColor(C_YELLOW);
+    tft.setCursor(224, CARD_Y + 4); tft.print("TEMP [HOLD]");
+  }
+}
 
 // FIX: không tràn màn hình 240px
 void updateStatus(const char* msg, int level) {
@@ -286,15 +310,14 @@ void showNoFinger() {
   if (!prevFinger) return; prevFinger = false;
   tft.fillRect(8,   VAL_Y, 88, 36, C_BG);
   tft.fillRect(115, VAL_Y, 88, 36, C_BG);
-  tft.fillRect(222, VAL_Y, 88, 36, C_BG);
+  // KHÔNG xóa card nhiệt độ (222, VAL_Y)
   tft.fillRect(WAVE_X, WAVE_Y, WAVE_W, WAVE_H, C_BG);
   tft.setTextColor(C_GRAY); tft.setTextSize(2);
   tft.setCursor(20, WAVE_Y + 16);
   tft.print("Place Finger...");
   waveInited = false;
-  prevHR = prevSPO2 = -99; prevTemp = -99; prevStatus = -1;
+  prevHR = prevSPO2 = -99; prevStatus = -1;  // KHÔNG reset prevTemp
 }
-
 // ════════════════════════════════════════════════
 //  VẼ SÓNG PPG
 // ════════════════════════════════════════════════
@@ -342,10 +365,11 @@ void fillBuffer() {
     irBuffer, 100, redBuffer,
     &spo2, &validSPO2, &heartRate_mx, &validHR_mx);
 }
-
 void readTemp() {
-  if (!mlxOK) return;
+  if (!mlxOK || !tempMeasuring) return;   // ← thêm !tempMeasuring
   float obj = mlx.readObjectTempC();
+  // ... phần còn lại giữ nguyên
+
   float amb = mlx.readAmbientTempC();
   Serial.printf("[TEMP] obj=%.2f  amb=%.2f\n", obj, amb);
   if (isnan(obj) || isinf(obj)) return;
@@ -384,6 +408,7 @@ void setup() {
   tft.setCursor(70, 100); tft.print("ESP32-C3 Mini + BLE");
   tft.setTextColor(C_GRAY);
   tft.setCursor(60, 120); tft.print("Khoi dong...");
+  pinMode(BTN_TEMP_PIN, INPUT_PULLUP);
 
   // I2C — 100kHz bắt buộc cho MLX90614
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -465,7 +490,18 @@ void loop() {
   static uint32_t lastReport = 0;
   static uint32_t lastDraw   = 0;
   static uint32_t lastTemp   = 0;
-
+// ── Nút toggle GY-906 (debounce 200ms) ──────────
+static bool     btnLast     = HIGH;
+static uint32_t btnDebounce = 0;
+bool btnNow = digitalRead(BTN_TEMP_PIN);
+if (btnNow == LOW && btnLast == HIGH &&
+    millis() - btnDebounce > 200) {
+  btnDebounce   = millis();
+  tempMeasuring = !tempMeasuring;
+  Serial.printf("{\"temp_mode\":\"%s\"}\n",
+                tempMeasuring ? "LIVE" : "HOLD");
+}
+btnLast = btnNow;
   // ── Đọc nhiệt độ 2s ──────────────────────────
   if (millis() - lastTemp >= 2000) {
     lastTemp = millis();
@@ -529,37 +565,81 @@ void loop() {
   int outHR  = (rawHR >= 40 && rawHR <= 180) ? rawHR : 0;
 
   // FIX SpO2 filter
+ // FIX SpO2 filter
   int outSpO2 = 0;
   if (validSPO2 && spo2 >= 70 && spo2 <= 100) outSpO2 = spo2;
 
   long outPPG = (long)irBuffer[99];
 
+  // ── Drift filter HR & SpO2 ───────────────────────
+  if (!fingerDetected) {
+    displayHR        = 0;
+    displaySPO2      = 0;
+    hrInited         = false;
+    spo2Inited       = false;
+    spo2DriftSamples = 0;
+  } else {
+    // ── HR ────────────────────────────────────────
+    if (outHR > 0) {
+      if (!hrInited) {
+        displayHR = outHR;
+        hrInited  = true;
+      } else if (outHR >= 60 && outHR <= 100) {
+        // Giữ nguyên
+      } else if (outHR > 100) {
+        displayHR++;
+      } else {
+        if (displayHR > 0) displayHR--;
+      }
+      displayHR = constrain(displayHR, 0, 250);
+    }
+    // ── SpO2 ──────────────────────────────────────
+    if (outSpO2 > 0) {
+      if (!spo2Inited) {
+        displaySPO2 = outSpO2;
+        spo2Inited  = true;
+      } else if (outSpO2 >= 94 && outSpO2 <= 100) {
+        // Giữ nguyên
+      } else {
+        spo2DriftSamples++;
+        if (spo2DriftSamples >= 2) {
+          spo2DriftSamples = 0;
+          if (displaySPO2 > 0) displaySPO2--;
+        }
+      }
+      displaySPO2 = constrain(displaySPO2, 0, 100);
+    }
+  }
   // ── Update TFT 250ms ─────────────────────────
-  if (millis() - lastDraw >= 250) {
-    lastDraw = millis();
-    if (!fingerDetected) {
-      showNoFinger();
-      updateStatus("Dat ngon tay len cam bien", 0);
-    } else {
-      prevFinger = true;
-      updateHR(outHR);
-      updateSpO2(outSpO2);
-      updateTemp(tempC);
-      drawWave();
+ if (millis() - lastDraw >= 250) {
+  lastDraw = millis();
 
-      if (outSpO2 > 0 && outSpO2 < 90)
+  // Nhiệt độ luôn hiển thị, bất kể có ngón tay hay không
+  updateTemp(tempC);
+  updateTempLabel(tempMeasuring);
+
+  if (!fingerDetected) {
+    showNoFinger();
+    updateStatus("Dat ngon tay len cam bien", 0);
+  } else {
+    prevFinger = true;
+      updateHR(displayHR);
+      updateSpO2(displaySPO2);
+    drawWave();
+
+      if (displaySPO2 > 0 && displaySPO2 < 90)
         updateStatus("!! SpO2 NGUY HIEM !!",       2);
-      else if (mlxOK && tempC >= 38.3f && outHR > 100)
+      else if (mlxOK && tempC >= 38.3f && displayHR > 100)
         updateStatus("!! SEPSIS RISK !!",           2);
       else if (mlxOK && tempC >= 38.3f)
         updateStatus("!! SOT CAO - FEVER !!",       1);
-      else if (outHR > 130)
+      else if (displayHR > 130)
         updateStatus("!! NHIP TIM NHANH !!",        1);
-      else if (outHR > 0 && outHR < 50)
+      else if (displayHR > 0 && displayHR < 50)
         updateStatus("!! NHIP TIM CHAM !!",         1);
-      else if (outSpO2 > 0 && outSpO2 < 94)
+      else if (displaySPO2 > 0 && displaySPO2 < 94)
         updateStatus("SpO2 THAP - Can theo doi",    1);
-      else if (outHR >= 50 && outSpO2 >= 94)
+      else if (displayHR >= 50 && displaySPO2 >= 94)
         updateStatus("BINH THUONG  :)",             0);
       else
         updateStatus("Dang do...",                  0);
@@ -582,7 +662,7 @@ void loop() {
     Serial.println("}");
 
     // BLE notify JSON đầy đủ
-    sendBLE(outHR, outSpO2, safeTemp, outPPG, fingerDetected);
+    sendBLE(displayHR, displaySPO2, safeTemp, outPPG, fingerDetected);
 
     if (!fingerDetected) {
       beatAvg = 0; beatsPerMinute = 0; rateSpot = 0;
