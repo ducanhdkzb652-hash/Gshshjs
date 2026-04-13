@@ -571,7 +571,7 @@ btnLast = btnNow;
 
   long outPPG = (long)irBuffer[99];
 
-  // ── Drift filter HR & SpO2 ───────────────────────
+ // ── Drift filter HR & SpO2 ───────────────────────
   if (!fingerDetected) {
     displayHR        = 0;
     displaySPO2      = 0;
@@ -580,36 +580,30 @@ btnLast = btnNow;
     spo2DriftSamples = 0;
   } else {
     // ── HR ────────────────────────────────────────
-    if (outHR > 0) {
-      if (!hrInited) {
-        displayHR = outHR;
-        hrInited  = true;
-      } else if (outHR >= 60 && outHR <= 100) {
-        // Giữ nguyên
-      } else if (outHR > 100) {
-        displayHR++;
-      } else {
-        if (displayHR > 0) displayHR--;
-      }
-      displayHR = constrain(displayHR, 0, 250);
+    if (outHR >= 60 && outHR <= 100) {
+      // Giá trị hợp lệ → dùng luôn
+      displayHR = outHR;
+      hrInited  = true;
+    } else if (hrInited) {
+      // Ngoài khoảng hợp lệ → trừ dần 1 mỗi mẫu
+      if (displayHR > 0) displayHR--;
     }
+    displayHR = constrain(displayHR, 0, 250);
     // ── SpO2 ──────────────────────────────────────
-    if (outSpO2 > 0) {
-      if (!spo2Inited) {
-        displaySPO2 = outSpO2;
-        spo2Inited  = true;
-      } else if (outSpO2 >= 94 && outSpO2 <= 100) {
-        // Giữ nguyên
-      } else {
-        spo2DriftSamples++;
-        if (spo2DriftSamples >= 2) {
-          spo2DriftSamples = 0;
-          if (displaySPO2 > 0) displaySPO2--;
-        }
+    if (outSpO2 >= 90 && outSpO2 <= 100) {
+      // Giá trị hợp lệ → dùng luôn
+      displaySPO2      = outSpO2;
+      spo2Inited       = true;
+      spo2DriftSamples = 0;
+    } else if (spo2Inited) {
+      // Ngoài khoảng hợp lệ → trừ dần 1 mỗi 2 mẫu
+      spo2DriftSamples++;
+      if (spo2DriftSamples >= 2) {
+        spo2DriftSamples = 0;
+        if (displaySPO2 > 0) displaySPO2--;
       }
-      displaySPO2 = constrain(displaySPO2, 0, 100);
     }
-  }
+    displaySPO2 = constrain(displaySPO2, 0, 100);
   // ── Update TFT 250ms ─────────────────────────
  if (millis() - lastDraw >= 250) {
   lastDraw = millis();
