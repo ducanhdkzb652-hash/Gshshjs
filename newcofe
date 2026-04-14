@@ -297,6 +297,8 @@ baseline_engine = PersonalizedBaseline()
 #  AI PREDICT
 # ================================================================
 ppg_buffer=deque(maxlen=WINDOW); ai_history=deque(maxlen=5)
+_predict_counter = 0          # chỉ predict mỗi 10 mẫu
+_last_label, _last_conf = "NORMAL", 0
 
 def extract_features(ppg,hr,spo2,temp,baseline):
     sig=np.array(ppg,dtype=float); dc=np.mean(sig)+1e-6
@@ -310,89 +312,128 @@ def extract_features(ppg,hr,spo2,temp,baseline):
         (temp-baseline.get("temp",36.6))/3,(pi-baseline.get("pi",5))/10],dtype=np.float32)
 
 def hybrid_predict(ppg,hr,spo2,temp):
+    global _predict_counter, _last_label, _last_conf
     ppg_buffer.append(ppg)
-    if len(ppg_buffer)<WINDOW: return "COLLECTING",0
-    sig=np.array(ppg_buffer,dtype=np.float32)
-    pi=np.std(sig)/(np.mean(sig)+1e-6)*100
-    baseline_engine.update(hr,spo2,temp,pi)
-    features=extract_features(sig,hr,spo2,temp,baseline_engine.baseline)
-    ppg_norm=(sig-np.mean(sig))/(np.std(sig)+1e-6); ppg_in=ppg_norm.reshape(1,WINDOW,1)
-    try:
-        dp=dl_model.predict([ppg_in,features.reshape(1,-1)]
-           if dl_model and len(dl_model.inputs)==2 else ppg_in,verbose=0)
-        dl_risk=float(dp[0][1]) if dl_model else 0.5
-    except: dl_risk=0.5
-    try: xgb_risk=float(xgb_model.predict_proba(features.reshape(1,-1))[0][1]) if xgb_model else dl_risk
-    except: xgb_risk=dl_risk
-    risk=0.6*dl_risk+0.4*xgb_risk
-    label="RISK" if risk>0.5 else "NORMAL"
+    if len(ppg_buffer) < WINDOW: return "COLLECTING", 0
+
+    # Throttle: chỉ chạy model mỗi 10 mẫu, giữa đó trả kết quả cũ
+    _predict_counter += 1
+    if _predict_counter % 10 != 0:
+        return _last_label, _last_conf
+
+    sig = np.array(ppg_buffer, dtype=np.float32)
+    pi  = np.std(sig) / (np.mean(sig) + 1e-6) * 100
+    baseline_engine.update(hr, spo2, temp, pi)
+    features = extract_features(sig, hr, spo2, temp, baseline_engine.baseline)
+    ppg_norm = (sig - np.mean(sig)) / (np.std(sig) + 1e-6)
+    ppg_in   = ppg_norm.reshape(1, WINDOW, 1)
+
+    # ── CNN-BiLSTM-Attention ──────────────────────────────────
+    dl_risk = 0.5
+    if dl_model:
+        try:
+            if DL_N_INPUTS == 2:
+                dp = dl_model.predict([ppg_in, features.reshape(1,-1)], verbose=0)
+            else:
+                dp = dl_model.predict(ppg_in, verbose=0)
+            dl_risk = float(dp[0][1]) if dp.shape[-1] >= 2 else float(dp[0][0])
+        except Exception as e:
+            print(f"[DL predict ERR] {e}")
+
+    # ── XGBoost ───────────────────────────────────────────────
+    xgb_risk = dl_risk
+    if xgb_model:
+        try:
+            xgb_risk = float(xgb_model.predict_proba(
+                features.reshape(1,-1))[0][1])
+        except Exception as e:
+            print(f"[XGB predict ERR] {e}")
+
+    risk  = 0.6 * dl_risk + 0.4 * xgb_risk
+    label = "RISK" if risk > 0.5 else "NORMAL"
     ai_history.append(label)
-    return "RISK" if ai_history.count("RISK")>=4 else "NORMAL", int(risk*100)
+    _last_label = "RISK" if ai_history.count("RISK") >= 4 else "NORMAL"
+    _last_conf  = int(risk * 100)
+    return _last_label, _last_conf
 
 # ================================================================
 #  PHÂN TÍCH HÌNH THÁI SÓNG PPG
 # ================================================================
-_wave_counter = 0   # đếm packet, phân tích mỗi 50 mẫu
+_wave_counter = 0            # đếm packet, phân tích mỗi 50 mẫu
+wave_buffer   = deque(maxlen=300)   # buffer riêng 3 giây (300 mẫu @ 100Hz)
 
 def analyze_ppg_waveform(sig):
     """
-    Phân tích hình thái sóng PPG, trả về dict các chỉ số:
-    - quality   : GOOD / FAIR / POOR
-    - rhythm    : REGULAR / IRREGULAR / VARIABLE
-    - hrv_ms    : Heart Rate Variability (ms)
-    - notch     : dicrotic notch có/không
-    - symmetry  : tỉ lệ rise/fall (bình thường ~0.3)
-    - amp_cv    : độ biến thiên biên độ (%) — cao = bất thường
-    - rise_ms   : thời gian lên (ms)
-    - fall_ms   : thời gian xuống (ms)
-    - warnings  : danh sách cảnh báo hình thái
+    Phân tích hình thái sóng PPG trên buffer 300 mẫu (3 giây).
+    Cần ít nhất 1 đỉnh để chạy phân tích cơ bản.
     """
     result = {
         "quality": "POOR", "rhythm": "?", "hrv_ms": 0.0,
         "notch": False, "symmetry": 0.0, "amp_cv": 0.0,
         "rise_ms": 0.0, "fall_ms": 0.0, "warnings": []
     }
-    if len(sig) < WINDOW: return result
-
     sig = np.array(sig, dtype=float)
-    warnings = []
+    if len(sig) < 50: return result   # cần ít nhất 50 mẫu
 
-    # ── 1. Tìm đỉnh systolic ──────────────────────────────────
-    min_dist = int(SAMPLE_RATE * 0.35)
-    peaks, props = find_peaks(sig, distance=min_dist,
-                              prominence=np.std(sig)*0.5)
-    if len(peaks) < 2:
-        result["quality"] = "POOR"
-        result["warnings"] = ["Khong du dinh de phan tich"]
+    warnings = []
+    sig_range = np.max(sig) - np.min(sig)
+
+    # ── 1. Tìm đỉnh systolic ─────────────────────────────────
+    # min_dist = 0.25s (240bpm max), prominence = 15% range (thấp hơn nhiều)
+    min_dist    = max(int(SAMPLE_RATE * 0.25), 10)
+    prom_thresh = max(sig_range * 0.15, np.std(sig) * 0.3)
+    peaks, _    = find_peaks(sig, distance=min_dist, prominence=prom_thresh)
+
+    # Nếu vẫn không tìm thấy, thử với ngưỡng rất thấp
+    if len(peaks) == 0:
+        peaks, _ = find_peaks(sig, distance=min_dist,
+                              prominence=sig_range * 0.05)
+
+    if len(peaks) == 0:
+        result["warnings"] = ["Tin hieu qua nhieu (noise)"]
         return result
 
-    # ── 2. Tìm đáy (valley) ───────────────────────────────────
-    valleys, _ = find_peaks(-sig, distance=min_dist)
+    # ── 2. Tìm đáy (valley) ──────────────────────────────────
+    valleys, _ = find_peaks(-sig, distance=min_dist,
+                             prominence=prom_thresh * 0.5)
+    if len(valleys) == 0:
+        valleys = np.array([np.argmin(sig)])
 
-    # ── 3. Biên độ & độ biến thiên ────────────────────────────
-    peak_vals   = sig[peaks]
-    valley_vals = sig[valleys] if len(valleys) > 0 else np.array([np.min(sig)])
-    avg_amp  = np.mean(peak_vals) - np.mean(valley_vals)
-    amp_cv   = np.std(peak_vals) / (np.mean(peak_vals) + 1e-6) * 100
+    # ── 3. Signal quality dựa trên số đỉnh tìm được ──────────
+    expected_peaks = len(sig) / SAMPLE_RATE * 100 / 60  # ước tính tại 100bpm
+    peak_ratio     = len(peaks) / max(expected_peaks, 1)
+    peak_vals      = sig[peaks]
+    valley_vals    = sig[valleys]
+    avg_amp        = np.mean(peak_vals) - np.mean(valley_vals)
+    amp_cv         = np.std(peak_vals) / (np.mean(peak_vals) + 1e-6) * 100
     result["amp_cv"] = round(amp_cv, 1)
+
+    snr = avg_amp / (np.std(sig) + 1e-6)
+    if   snr > 2.5 and amp_cv < 20 and len(peaks) >= 2: quality = "GOOD"
+    elif snr > 1.2 or  amp_cv < 35:                     quality = "FAIR"
+    else:                                                quality = "POOR"
+    result["quality"] = quality
+
     if amp_cv > 25:
         warnings.append(f"Bien do khong on dinh ({amp_cv:.0f}%)")
 
-    # ── 4. HRV từ khoảng cách đỉnh ───────────────────────────
-    rr = np.diff(peaks) / SAMPLE_RATE * 1000   # ms
-    hrv_ms = float(np.std(rr))
-    result["hrv_ms"] = round(hrv_ms, 1)
-    rr_cv = np.std(rr) / (np.mean(rr) + 1e-6)
-    if rr_cv < 0.08:
-        rhythm = "REGULAR"
-    elif rr_cv < 0.20:
-        rhythm = "VARIABLE"
+    # ── 4. HRV & Rhythm (cần ≥2 đỉnh) ───────────────────────
+    if len(peaks) >= 2:
+        rr     = np.diff(peaks) / SAMPLE_RATE * 1000   # ms
+        hrv_ms = float(np.std(rr))
+        rr_cv  = np.std(rr) / (np.mean(rr) + 1e-6)
+        result["hrv_ms"] = round(hrv_ms, 1)
+        if   rr_cv < 0.08: rhythm = "REGULAR"
+        elif rr_cv < 0.20: rhythm = "VARIABLE"
+        else:
+            rhythm = "IRREGULAR"
+            warnings.append("Nhip khong deu (loạn nhịp?)")
+        result["rhythm"] = rhythm
     else:
-        rhythm = "IRREGULAR"
-        warnings.append("Nhip bat thuong / khong deu")
-    result["rhythm"] = rhythm
+        # 1 đỉnh → ước tính HR, chưa có HRV
+        result["rhythm"] = "1 DINH"
 
-    # ── 5. Rise time / Fall time ──────────────────────────────
+    # ── 5. Rise / Fall time ───────────────────────────────────
     rise_list, fall_list = [], []
     for pk in peaks:
         pv_before = valleys[valleys < pk]
@@ -403,43 +444,31 @@ def analyze_ppg_waveform(sig):
     if rise_list and fall_list:
         avg_rise = float(np.mean(rise_list))
         avg_fall = float(np.mean(fall_list))
-        sym = avg_rise / (avg_rise + avg_fall + 1e-6)
-        result["rise_ms"]   = round(avg_rise, 0)
-        result["fall_ms"]   = round(avg_fall, 0)
-        result["symmetry"]  = round(sym, 2)
-        # Bình thường rise ~30% chu kỳ; nếu >50% → sóng lên chậm
-        if sym > 0.50:
-            warnings.append("Song len cham (giam tuoi mau)")
-        if sym < 0.15:
-            warnings.append("Song len qua nhanh (co mach bat thuong)")
+        sym      = avg_rise / (avg_rise + avg_fall + 1e-6)
+        result["rise_ms"]  = round(avg_rise, 0)
+        result["fall_ms"]  = round(avg_fall, 0)
+        result["symmetry"] = round(sym, 2)
+        if sym > 0.50: warnings.append("Song len cham (giam tuoi mau)")
+        if sym < 0.15: warnings.append("Song len qua nhanh (co mach?)")
 
-    # ── 6. Dicrotic notch detection ───────────────────────────
+    # ── 6. Dicrotic notch (cần ≥1 đỉnh + valley sau) ─────────
     notch_count = 0
-    for pk in peaks[:min(4, len(peaks))]:
+    for pk in peaks[:4]:
         pv_after = valleys[valleys > pk]
         if len(pv_after) == 0: continue
         segment = sig[pk : pv_after[0]]
-        if len(segment) < 8: continue
-        # Phát hiện điểm uốn dương trên đoạn giảm → dấu hiệu notch
+        if len(segment) < 6: continue
         d2 = np.diff(np.diff(segment.astype(float)))
-        # Notch: có ít nhất 3 sample liên tiếp d2 > 0 trong nửa sau
-        mid = len(d2)//2
-        if np.sum(d2[mid:] > 0) >= 3:
+        mid = len(d2) // 2
+        if len(d2) > mid and np.sum(d2[mid:] > 0) >= 2:
             notch_count += 1
-    result["notch"] = notch_count >= 2
-    if not result["notch"]:
-        warnings.append("Khong co dicrotic notch (thanh mach cung?)")
+    result["notch"] = notch_count >= 1
+    if not result["notch"] and len(peaks) >= 2:
+        warnings.append("Khong ro dicrotic notch")
 
-    # ── 7. Signal quality ─────────────────────────────────────
-    snr = avg_amp / (np.std(sig) + 1e-6)
-    if   snr > 3.0 and amp_cv < 20: quality = "GOOD"
-    elif snr > 1.5 or  amp_cv < 35: quality = "FAIR"
-    else:                             quality = "POOR"
-    result["quality"]  = quality
     result["warnings"] = warnings
-    if quality == "POOR":
-        result["warnings"].insert(0, "Chat luong tin hieu kem")
-
+    if quality == "POOR" and not warnings:
+        result["warnings"] = ["Chat luong tin hieu kem"]
     return result
 
 # ================================================================
