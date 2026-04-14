@@ -297,8 +297,54 @@ baseline_engine = PersonalizedBaseline()
 #  AI PREDICT
 # ================================================================
 ppg_buffer=deque(maxlen=WINDOW); ai_history=deque(maxlen=5)
-_predict_counter = 0          # chỉ predict mỗi 10 mẫu
+_predict_counter = 0
 _last_label, _last_conf = "NORMAL", 0
+
+# ── AI chạy trong thread riêng, không block serial/BLE ───────
+import queue as _queue_mod
+_ai_queue  = _queue_mod.Queue(maxsize=3)   # input: (ppg_in, features)
+_ai_result = {"label": "NORMAL", "conf": 0, "dl": 0.5, "xgb": 0.5}
+_ai_lock   = threading.Lock()
+
+def _ai_worker():
+    """Thread chạy liên tục, xử lý inference CNN + XGBoost."""
+    while True:
+        try:
+            ppg_in, features, hr_spo2_temp = _ai_queue.get(timeout=0.5)
+        except _queue_mod.Empty:
+            continue
+        dl_risk = 0.5
+        if dl_model:
+            try:
+                if DL_N_INPUTS == 2:
+                    dp = dl_model.predict([ppg_in, features.reshape(1,-1)], verbose=0)
+                else:
+                    dp = dl_model.predict(ppg_in, verbose=0)
+                dl_risk = float(dp[0][1]) if dp.shape[-1] >= 2 else float(dp[0][0])
+            except Exception as e:
+                print(f"[DL ERR] {e}")
+        xgb_risk = dl_risk
+        if xgb_model:
+            try:
+                xgb_risk = float(xgb_model.predict_proba(
+                    features.reshape(1,-1))[0][1])
+            except Exception as e:
+                print(f"[XGB ERR] {e}")
+        risk  = 0.6 * dl_risk + 0.4 * xgb_risk
+        # Log mỗi 10 lần predict để theo dõi
+        if _predict_counter % 50 == 0:
+            hr_v, spo2_v, temp_v = hr_spo2_temp
+            print(f"[AI] dl={dl_risk:.3f} xgb={xgb_risk:.3f} "
+                  f"risk={risk:.3f} | HR={hr_v} SpO2={spo2_v} T={temp_v:.1f}"
+                  f" | output_shape={dp.shape if dl_model else 'N/A'}")
+        label = "RISK" if risk > 0.5 else "NORMAL"
+        with _ai_lock:
+            ai_history.append(label)
+            final = "RISK" if ai_history.count("RISK") >= 4 else "NORMAL"
+            _ai_result.update({"label": final, "conf": int(risk*100),
+                               "dl": round(dl_risk,3), "xgb": round(xgb_risk,3)})
+
+threading.Thread(target=_ai_worker, daemon=True).start()
 
 def extract_features(ppg,hr,spo2,temp,baseline):
     sig=np.array(ppg,dtype=float); dc=np.mean(sig)+1e-6
@@ -311,55 +357,36 @@ def extract_features(ppg,hr,spo2,temp,baseline):
         (hr-baseline.get("hr",70))/50,(spo2-baseline.get("spo2",98))/10,
         (temp-baseline.get("temp",36.6))/3,(pi-baseline.get("pi",5))/10],dtype=np.float32)
 
-def hybrid_predict(ppg,hr,spo2,temp):
-    global _predict_counter, _last_label, _last_conf
+def hybrid_predict(ppg, hr, spo2, temp):
+    """Nạp dữ liệu vào queue AI, trả ngay kết quả mới nhất — không block."""
+    global _predict_counter
     ppg_buffer.append(ppg)
-    if len(ppg_buffer) < WINDOW: return "COLLECTING", 0
-
-    # Throttle: chỉ chạy model mỗi 10 mẫu, giữa đó trả kết quả cũ
-    _predict_counter += 1
-    if _predict_counter % 10 != 0:
-        return _last_label, _last_conf
+    if len(ppg_buffer) < WINDOW:
+        return "COLLECTING", 0
 
     sig = np.array(ppg_buffer, dtype=np.float32)
     pi  = np.std(sig) / (np.mean(sig) + 1e-6) * 100
     baseline_engine.update(hr, spo2, temp, pi)
-    features = extract_features(sig, hr, spo2, temp, baseline_engine.baseline)
-    ppg_norm = (sig - np.mean(sig)) / (np.std(sig) + 1e-6)
-    ppg_in   = ppg_norm.reshape(1, WINDOW, 1)
 
-    # ── CNN-BiLSTM-Attention ──────────────────────────────────
-    dl_risk = 0.5
-    if dl_model:
+    # Đẩy vào queue mỗi 5 mẫu (0.05s) — queue có maxsize=3 nên tự drop nếu đầy
+    _predict_counter += 1
+    if _predict_counter % 5 == 0:
+        features = extract_features(sig, hr, spo2, temp, baseline_engine.baseline)
+        ppg_norm = (sig - np.mean(sig)) / (np.std(sig) + 1e-6)
+        ppg_in   = ppg_norm.reshape(1, WINDOW, 1)
         try:
-            if DL_N_INPUTS == 2:
-                dp = dl_model.predict([ppg_in, features.reshape(1,-1)], verbose=0)
-            else:
-                dp = dl_model.predict(ppg_in, verbose=0)
-            dl_risk = float(dp[0][1]) if dp.shape[-1] >= 2 else float(dp[0][0])
-        except Exception as e:
-            print(f"[DL predict ERR] {e}")
+            _ai_queue.put_nowait((ppg_in, features, (hr, spo2, temp)))
+        except _queue_mod.Full:
+            pass   # queue đầy → bỏ qua, không block
 
-    # ── XGBoost ───────────────────────────────────────────────
-    xgb_risk = dl_risk
-    if xgb_model:
-        try:
-            xgb_risk = float(xgb_model.predict_proba(
-                features.reshape(1,-1))[0][1])
-        except Exception as e:
-            print(f"[XGB predict ERR] {e}")
-
-    risk  = 0.6 * dl_risk + 0.4 * xgb_risk
-    label = "RISK" if risk > 0.5 else "NORMAL"
-    ai_history.append(label)
-    _last_label = "RISK" if ai_history.count("RISK") >= 4 else "NORMAL"
-    _last_conf  = int(risk * 100)
-    return _last_label, _last_conf
+    # Trả ngay kết quả mới nhất từ AI thread
+    with _ai_lock:
+        return _ai_result["label"], _ai_result["conf"]
 
 # ================================================================
 #  PHÂN TÍCH HÌNH THÁI SÓNG PPG
 # ================================================================
-_wave_counter = 0            # đếm packet, phân tích mỗi 50 mẫu
+_wave_counter = 0            # đếm packet, phân tích mỗi 20 mẫu (0.2s)
 wave_buffer   = deque(maxlen=300)   # buffer riêng 3 giây (300 mẫu @ 100Hz)
 
 def analyze_ppg_waveform(sig):
@@ -542,9 +569,9 @@ def process_packet(raw_str):
         pi=np.std(sig)/(np.mean(sig)+1e-6)*100
         write_row(hr,spo2,last_temp,ppg,pi,label,conf)
         history.append([time.time(),hr,spo2,last_temp,label,conf])
-        # Phân tích sóng mỗi 50 mẫu, dùng wave_buffer 300 mẫu (3 giây)
+        # Phân tích sóng mỗi 20 mẫu (0.2s), dùng wave_buffer 300 mẫu (3 giây)
         _wave_counter += 1
-        if _wave_counter % 50 == 0 and len(wave_buffer) >= 50:
+        if _wave_counter % 20 == 0 and len(wave_buffer) >= 50:
             wave_sig = np.array(wave_buffer)
             root.after(0, lambda w=wave_sig: update_wave_panel(analyze_ppg_waveform(w)))
     except Exception as e: print("Packet ERR:",e)
@@ -1159,6 +1186,14 @@ def _calc_report_stats():
 
     duration = int(history[-1][0]-history[0][0]) if len(history)>1 else 0
 
+    # Điểm model lần cuối (để hiển thị trong báo cáo)
+    with _ai_lock:
+        last_dl  = _ai_result.get("dl",  0.5)
+        last_xgb = _ai_result.get("xgb", 0.5)
+
+    # Cảnh báo nhiệt độ không hợp lệ
+    temp_warn = avg_temp < 34.0 or avg_temp > 42.0
+
     return dict(
         hrs=hrs, spo2s=spo2s, temps=temps,
         rr=rr, avg_conf=avg_conf, avg_conf_risk=avg_conf_risk,
@@ -1167,6 +1202,7 @@ def _calc_report_stats():
         n_risk=len(risk_samples), n_total=len(history),
         conc=conc, model_str=model_str, duration=duration,
         ai_high=ai_high, clin_high=clin_high,
+        last_dl=last_dl, last_xgb=last_xgb, temp_warn=temp_warn,
     )
 
 # ================================================================
