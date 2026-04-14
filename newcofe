@@ -329,12 +329,18 @@ _ai_lock   = threading.Lock()
 
 def _ai_worker():
     """Thread chạy liên tục, xử lý inference CNN + XGBoost."""
+    # Detect số feature XGBoost cần lúc khởi động
+    xgb_nf = getattr(xgb_model, "n_features_in_", 15) if xgb_model else 15
+    print(f"[AI] Worker started | DL_inputs={DL_N_INPUTS} | XGB_features={xgb_nf}")
+
     while True:
         try:
             ppg_in, features, hr_spo2_temp = _ai_queue.get(timeout=0.5)
         except _queue_mod.Empty:
             continue
-        dl_risk = 0.5
+
+        # ── CNN / LSTM ────────────────────────────────────────
+        dl_risk = 0.5; dp = None
         if dl_model:
             try:
                 if DL_N_INPUTS == 2:
@@ -344,20 +350,34 @@ def _ai_worker():
                 dl_risk = float(dp[0][1]) if dp.shape[-1] >= 2 else float(dp[0][0])
             except Exception as e:
                 print(f"[DL ERR] {e}")
+
+        # ── XGBoost — tự động chọn đúng số features ──────────
         xgb_risk = dl_risk
         if xgb_model:
             try:
-                xgb_risk = float(xgb_model.predict_proba(
-                    features.reshape(1,-1))[0][1])
+                hr_v, spo2_v, temp_v = hr_spo2_temp
+                if xgb_nf == 3:
+                    # Model train với [HR, SpO2, Temp] chuẩn hóa
+                    xgb_feat = np.array([[hr_v/200, spo2_v/100, (temp_v-35)/5]],
+                                        dtype=np.float32)
+                elif xgb_nf <= len(features):
+                    # Lấy n features đầu
+                    xgb_feat = features[:xgb_nf].reshape(1,-1)
+                else:
+                    xgb_feat = features.reshape(1,-1)
+                xgb_risk = float(xgb_model.predict_proba(xgb_feat)[0][1])
             except Exception as e:
                 print(f"[XGB ERR] {e}")
-        risk  = 0.6 * dl_risk + 0.4 * xgb_risk
-        # Log mỗi 10 lần predict để theo dõi
+
+        risk = 0.6 * dl_risk + 0.4 * xgb_risk
+
+        # Log mỗi 50 lần predict
         if _predict_counter % 50 == 0:
             hr_v, spo2_v, temp_v = hr_spo2_temp
-            print(f"[AI] dl={dl_risk:.3f} xgb={xgb_risk:.3f} "
-                  f"risk={risk:.3f} | HR={hr_v} SpO2={spo2_v} T={temp_v:.1f}"
-                  f" | output_shape={dp.shape if dl_model else 'N/A'}")
+            out_shape = dp.shape if dp is not None else "N/A"
+            print(f"[AI] dl={dl_risk:.3f} xgb={xgb_risk:.3f} risk={risk:.3f}"
+                  f" | HR={hr_v:.0f} SpO2={spo2_v:.1f} T={temp_v:.1f}"
+                  f" | dl_shape={out_shape}")
         label = "RISK" if risk > 0.5 else "NORMAL"
         with _ai_lock:
             ai_history.append(label)
