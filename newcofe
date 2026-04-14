@@ -28,30 +28,51 @@ from matplotlib.figure import Figure
 try:
     import tensorflow as tf
     dl_model = tf.keras.models.load_model("cnn_bilstm_attention.h5")
-    # ── Chẩn đoán model ──────────────────────────────────────
+    # ── Chẩn đoán model thực tế ──────────────────────────────
     _n_inputs  = len(dl_model.inputs)
     _n_outputs = len(dl_model.outputs)
     _layers    = [l.__class__.__name__ for l in dl_model.layers]
     _has_cnn   = any("Conv" in l for l in _layers)
-    _has_lstm  = any("LSTM" in l or "lstm" in l for l in _layers)
-    _has_attn  = any("Attention" in l or "attention" in l for l in _layers)
+    _has_bilstm= any("Bidirectional" in l for l in _layers)
+    _has_lstm  = any("LSTM" in l for l in _layers)
+    _has_attn  = any("Attention" in l or "attention" in l.lower() for l in _layers)
+    # Tên model thực tế dựa trên layers
+    _parts = []
+    if _has_cnn:    _parts.append("CNN")
+    if _has_bilstm: _parts.append("BiLSTM")
+    elif _has_lstm: _parts.append("LSTM")
+    if _has_attn:   _parts.append("Attention")
+    DL_MODEL_NAME = "-".join(_parts) if _parts else "DL"
     print("=" * 50)
-    print(f"[MODEL] CNN-BiLSTM loaded OK")
+    print(f"[MODEL] {DL_MODEL_NAME} loaded OK")
     print(f"  Input(s)  : {_n_inputs}  | Output(s): {_n_outputs}")
-    print(f"  CNN layer : {'YES' if _has_cnn  else 'NO'}")
-    print(f"  BiLSTM    : {'YES' if _has_lstm else 'NO'}")
-    print(f"  Attention : {'YES' if _has_attn else 'NO'}")
+    print(f"  CNN       : {'YES' if _has_cnn    else 'NO'}")
+    print(f"  BiLSTM    : {'YES' if _has_bilstm else 'NO'}")
+    print(f"  LSTM      : {'YES' if _has_lstm   else 'NO'}")
+    print(f"  Attention : {'YES' if _has_attn   else 'NO'}")
     print(f"  Layers    : {_layers}")
     print("=" * 50)
-    DL_N_INPUTS = _n_inputs   # lưu lại để dùng khi predict
+    DL_N_INPUTS = _n_inputs
 except Exception as e:
-    dl_model = None; DL_N_INPUTS = 1
+    dl_model = None; DL_N_INPUTS = 1; DL_MODEL_NAME = "N/A"
     print(f"[MODEL] DL load FAIL: {e}")
 
 try:
     import joblib
-    xgb_model = joblib.load("xgb_sepsis.pkl")
-    print(f"[MODEL] XGBoost loaded OK | n_features={xgb_model.n_features_in_}")
+    # Thử xgb_sepsis.pkl trước, fallback về sepsis_model.pkl
+    for _pkl in ["xgb_sepsis.pkl", "sepsis_model.pkl"]:
+        try:
+            _m = joblib.load(_pkl)
+            if _m is not None:
+                xgb_model = _m
+                _nf = getattr(xgb_model, "n_features_in_", "?")
+                print(f"[MODEL] XGBoost loaded OK từ '{_pkl}' | n_features={_nf}")
+                break
+        except Exception as _e:
+            print(f"[MODEL] Thu '{_pkl}': {_e}")
+    else:
+        xgb_model = None
+        print("[MODEL] XGBoost FAIL: khong load duoc file pkl nao")
 except Exception as e:
     xgb_model = None
     print(f"[MODEL] XGBoost load FAIL: {e}")
@@ -1180,7 +1201,7 @@ def _calc_report_stats():
         conc = "NGUY CO THAP"
 
     model_info = []
-    if dl_model:  model_info.append("CNN-BiLSTM")
+    if dl_model:  model_info.append(DL_MODEL_NAME)
     if xgb_model: model_info.append("XGBoost")
     model_str = " + ".join(model_info) if model_info else "Rule-based (no model)"
 
@@ -1318,8 +1339,18 @@ def show_report_window():
     row("Conf TB mau RISK",
         f"{s['avg_conf_risk']:.1f}%",
         ACC2 if s['avg_conf_risk']>70 else WARN if s['avg_conf_risk']>50 else GREEN)
+    row("CNN-BiLSTM score",
+        f"{s['last_dl']:.3f}  ({'RISK' if s['last_dl']>0.5 else 'NORMAL'})",
+        ACC2 if s['last_dl']>0.5 else GREEN)
+    row("XGBoost score",
+        f"{s['last_xgb']:.3f}  ({'RISK' if s['last_xgb']>0.5 else 'NORMAL'})",
+        ACC2 if s['last_xgb']>0.5 else GREEN)
     row("AI canh bao",  "CO" if s['ai_high'] else "KHONG",
         ACC2 if s['ai_high'] else GREEN)
+    if s['temp_warn']:
+        tk.Label(info_frame,
+                 text=f"  ⚠ Nhiet do {s['avg_temp']:.1f}°C bat thuong — kiem tra sensor nhiet!",
+                 font=("Consolas",8), bg=BG, fg=ACC2).pack(anchor="w")
 
     # ── Phân tích sóng ──────────────────────────────────────
     if _last_wave:
