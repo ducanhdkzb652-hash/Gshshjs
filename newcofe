@@ -313,6 +313,119 @@ def hybrid_predict(ppg,hr,spo2,temp):
     return "RISK" if ai_history.count("RISK")>=4 else "NORMAL", int(risk*100)
 
 # ================================================================
+#  PHÂN TÍCH HÌNH THÁI SÓNG PPG
+# ================================================================
+_wave_counter = 0   # đếm packet, phân tích mỗi 50 mẫu
+
+def analyze_ppg_waveform(sig):
+    """
+    Phân tích hình thái sóng PPG, trả về dict các chỉ số:
+    - quality   : GOOD / FAIR / POOR
+    - rhythm    : REGULAR / IRREGULAR / VARIABLE
+    - hrv_ms    : Heart Rate Variability (ms)
+    - notch     : dicrotic notch có/không
+    - symmetry  : tỉ lệ rise/fall (bình thường ~0.3)
+    - amp_cv    : độ biến thiên biên độ (%) — cao = bất thường
+    - rise_ms   : thời gian lên (ms)
+    - fall_ms   : thời gian xuống (ms)
+    - warnings  : danh sách cảnh báo hình thái
+    """
+    result = {
+        "quality": "POOR", "rhythm": "?", "hrv_ms": 0.0,
+        "notch": False, "symmetry": 0.0, "amp_cv": 0.0,
+        "rise_ms": 0.0, "fall_ms": 0.0, "warnings": []
+    }
+    if len(sig) < WINDOW: return result
+
+    sig = np.array(sig, dtype=float)
+    warnings = []
+
+    # ── 1. Tìm đỉnh systolic ──────────────────────────────────
+    min_dist = int(SAMPLE_RATE * 0.35)
+    peaks, props = find_peaks(sig, distance=min_dist,
+                              prominence=np.std(sig)*0.5)
+    if len(peaks) < 2:
+        result["quality"] = "POOR"
+        result["warnings"] = ["Khong du dinh de phan tich"]
+        return result
+
+    # ── 2. Tìm đáy (valley) ───────────────────────────────────
+    valleys, _ = find_peaks(-sig, distance=min_dist)
+
+    # ── 3. Biên độ & độ biến thiên ────────────────────────────
+    peak_vals   = sig[peaks]
+    valley_vals = sig[valleys] if len(valleys) > 0 else np.array([np.min(sig)])
+    avg_amp  = np.mean(peak_vals) - np.mean(valley_vals)
+    amp_cv   = np.std(peak_vals) / (np.mean(peak_vals) + 1e-6) * 100
+    result["amp_cv"] = round(amp_cv, 1)
+    if amp_cv > 25:
+        warnings.append(f"Bien do khong on dinh ({amp_cv:.0f}%)")
+
+    # ── 4. HRV từ khoảng cách đỉnh ───────────────────────────
+    rr = np.diff(peaks) / SAMPLE_RATE * 1000   # ms
+    hrv_ms = float(np.std(rr))
+    result["hrv_ms"] = round(hrv_ms, 1)
+    rr_cv = np.std(rr) / (np.mean(rr) + 1e-6)
+    if rr_cv < 0.08:
+        rhythm = "REGULAR"
+    elif rr_cv < 0.20:
+        rhythm = "VARIABLE"
+    else:
+        rhythm = "IRREGULAR"
+        warnings.append("Nhip bat thuong / khong deu")
+    result["rhythm"] = rhythm
+
+    # ── 5. Rise time / Fall time ──────────────────────────────
+    rise_list, fall_list = [], []
+    for pk in peaks:
+        pv_before = valleys[valleys < pk]
+        pv_after  = valleys[valleys > pk]
+        if len(pv_before) > 0 and len(pv_after) > 0:
+            rise_list.append((pk - pv_before[-1]) / SAMPLE_RATE * 1000)
+            fall_list.append((pv_after[0]  - pk)  / SAMPLE_RATE * 1000)
+    if rise_list and fall_list:
+        avg_rise = float(np.mean(rise_list))
+        avg_fall = float(np.mean(fall_list))
+        sym = avg_rise / (avg_rise + avg_fall + 1e-6)
+        result["rise_ms"]   = round(avg_rise, 0)
+        result["fall_ms"]   = round(avg_fall, 0)
+        result["symmetry"]  = round(sym, 2)
+        # Bình thường rise ~30% chu kỳ; nếu >50% → sóng lên chậm
+        if sym > 0.50:
+            warnings.append("Song len cham (giam tuoi mau)")
+        if sym < 0.15:
+            warnings.append("Song len qua nhanh (co mach bat thuong)")
+
+    # ── 6. Dicrotic notch detection ───────────────────────────
+    notch_count = 0
+    for pk in peaks[:min(4, len(peaks))]:
+        pv_after = valleys[valleys > pk]
+        if len(pv_after) == 0: continue
+        segment = sig[pk : pv_after[0]]
+        if len(segment) < 8: continue
+        # Phát hiện điểm uốn dương trên đoạn giảm → dấu hiệu notch
+        d2 = np.diff(np.diff(segment.astype(float)))
+        # Notch: có ít nhất 3 sample liên tiếp d2 > 0 trong nửa sau
+        mid = len(d2)//2
+        if np.sum(d2[mid:] > 0) >= 3:
+            notch_count += 1
+    result["notch"] = notch_count >= 2
+    if not result["notch"]:
+        warnings.append("Khong co dicrotic notch (thanh mach cung?)")
+
+    # ── 7. Signal quality ─────────────────────────────────────
+    snr = avg_amp / (np.std(sig) + 1e-6)
+    if   snr > 3.0 and amp_cv < 20: quality = "GOOD"
+    elif snr > 1.5 or  amp_cv < 35: quality = "FAIR"
+    else:                             quality = "POOR"
+    result["quality"]  = quality
+    result["warnings"] = warnings
+    if quality == "POOR":
+        result["warnings"].insert(0, "Chat luong tin hieu kem")
+
+    return result
+
+# ================================================================
 #  AUTO SAVE
 # ================================================================
 current_csv=current_writer=session_start=None; history=[]
@@ -357,7 +470,7 @@ ble_running=False; ble_loop=None
 #  PROCESS INCOMING PACKET (dùng chung USB + BLE)
 # ================================================================
 def process_packet(raw_str):
-    global last_temp
+    global last_temp, _wave_counter
     try:
         pkt=json.loads(raw_str)
         if "p" in pkt and len(pkt)==1:
@@ -380,6 +493,11 @@ def process_packet(raw_str):
         pi=np.std(sig)/(np.mean(sig)+1e-6)*100
         write_row(hr,spo2,last_temp,ppg,pi,label,conf)
         history.append([time.time(),hr,spo2,last_temp,label,conf])
+        # Phân tích sóng mỗi 50 mẫu
+        _wave_counter += 1
+        if _wave_counter % 50 == 0 and len(ppg_buffer) == WINDOW:
+            wave = analyze_ppg_waveform(np.array(ppg_buffer))
+            root.after(0, lambda w=wave: update_wave_panel(w))
     except Exception as e: print("Packet ERR:",e)
 
 # ================================================================
@@ -574,7 +692,81 @@ line_ppg,=ax.plot(np.arange(200),ppg_plot,color=ACC,linewidth=1.3,alpha=0.9)
 canvas=FigureCanvasTkAgg(fig,tab_monitor)
 canvas.get_tk_widget().pack(fill="both",expand=True,padx=10,pady=4)
 
+# ── WAVE ANALYSIS PANEL ──────────────────────────────────────
+wave_frame = tk.Frame(tab_monitor, bg=CARD); wave_frame.pack(fill="x", padx=10, pady=(0,4))
+tk.Frame(wave_frame, bg=PURPLE, height=2).pack(fill="x")
+
+wave_top = tk.Frame(wave_frame, bg=CARD); wave_top.pack(fill="x", padx=8, pady=(4,2))
+tk.Label(wave_top, text="PHAN TICH SONG MACH  (cap nhat moi 50 mau)",
+         font=("Consolas",8,"bold"), bg=CARD, fg=PURPLE).pack(side="left")
+
+wave_cols = tk.Frame(wave_frame, bg=CARD); wave_cols.pack(fill="x", padx=8, pady=(0,6))
+
+def _wlabel(parent, title, var, color):
+    f = tk.Frame(parent, bg=CARD); f.pack(side="left", expand=True, padx=6)
+    tk.Label(f, text=title, font=("Consolas",7), bg=CARD, fg=GRAY).pack()
+    tk.Label(f, textvariable=var, font=("Consolas",9,"bold"), bg=CARD, fg=color).pack()
+
+wv_quality  = tk.StringVar(value="-")
+wv_rhythm   = tk.StringVar(value="-")
+wv_hrv      = tk.StringVar(value="-")
+wv_notch    = tk.StringVar(value="-")
+wv_sym      = tk.StringVar(value="-")
+wv_ampCV    = tk.StringVar(value="-")
+wv_rise     = tk.StringVar(value="-")
+wv_warn     = tk.StringVar(value="Cho du lieu...")
+
+_wlabel(wave_cols, "CHAT LUONG",   wv_quality, GREEN)
+_wlabel(wave_cols, "NHIP",         wv_rhythm,  ACC)
+_wlabel(wave_cols, "HRV (ms)",     wv_hrv,     PURPLE)
+_wlabel(wave_cols, "NOTCH",        wv_notch,   WARN)
+_wlabel(wave_cols, "SYM rise/tot", wv_sym,     ACC)
+_wlabel(wave_cols, "AMP VAR %",    wv_ampCV,   WARN)
+_wlabel(wave_cols, "RISE/FALL ms", wv_rise,    TEXT)
+
+# Dòng cảnh báo hình thái
+warn_lbl = tk.Label(wave_frame, textvariable=wv_warn,
+                    font=("Consolas",8), bg=CARD, fg=ACC2, wraplength=900, justify="left")
+warn_lbl.pack(anchor="w", padx=10, pady=(0,4))
+
+# Lưu kết quả phân tích sóng mới nhất để đưa vào báo cáo
+_last_wave = {}
+
+def update_wave_panel(w):
+    global _last_wave
+    _last_wave = w
+    qcolor  = GREEN if w["quality"]=="GOOD" else WARN if w["quality"]=="FAIR" else ACC2
+    rcolor  = GREEN if w["rhythm"]=="REGULAR" else ACC2 if w["rhythm"]=="IRREGULAR" else WARN
+    ncolor  = GREEN if w["notch"] else WARN
+    accolor = GREEN if w["amp_cv"]<15 else WARN if w["amp_cv"]<30 else ACC2
+
+    wv_quality.set(w["quality"])
+    wv_rhythm.set(w["rhythm"])
+    wv_hrv.set(f"{w['hrv_ms']:.1f}")
+    wv_notch.set("CO" if w["notch"] else "KHONG")
+    wv_sym.set(f"{w['symmetry']:.2f}")
+    wv_ampCV.set(f"{w['amp_cv']:.1f}%")
+    wv_rise.set(f"{w['rise_ms']:.0f}/{w['fall_ms']:.0f}")
+
+    # Cập nhật màu động
+    for child in wave_cols.winfo_children():
+        labels = child.winfo_children()
+        if len(labels) < 2: continue
+    # set màu trực tiếp qua configure
+    wave_cols.winfo_children()[0].winfo_children()[1].configure(fg=qcolor)
+    wave_cols.winfo_children()[1].winfo_children()[1].configure(fg=rcolor)
+    wave_cols.winfo_children()[3].winfo_children()[1].configure(fg=ncolor)
+    wave_cols.winfo_children()[5].winfo_children()[1].configure(fg=accolor)
+
+    if w["warnings"]:
+        wv_warn.set("⚠  " + "  |  ".join(w["warnings"]))
+        warn_lbl.configure(fg=ACC2)
+    else:
+        wv_warn.set("✓  Song binh thuong")
+        warn_lbl.configure(fg=GREEN)
+
 mb=tk.Frame(tab_monitor,bg=BG); mb.pack(pady=4)
+
 def btn(parent,text,cmd,color=ACC):
     b=tk.Button(parent,text=text,command=cmd,bg=CARD,fg=color,
                 font=("Consolas",9,"bold"),relief="flat",padx=10,pady=4,
@@ -934,6 +1126,23 @@ def export_report():
     if len(history)<10: messagebox.showwarning("","Can it nhat 10 mau"); return
     s = _calc_report_stats()
     pinfo = (f"ID:{current_patient[0]} | {current_patient[1]}" if current_patient else "Khong co ho so")
+    w = _last_wave  # kết quả phân tích sóng gần nhất
+    wave_section = ""
+    if w:
+        wave_section = (
+            f"\n--- PHAN TICH HINH THAI SONG PPG ---\n"
+            f"Chat luong tin hieu : {w.get('quality','-')}\n"
+            f"Nhip                : {w.get('rhythm','-')}\n"
+            f"HRV                 : {w.get('hrv_ms',0):.1f} ms\n"
+            f"Dicrotic notch      : {'CO' if w.get('notch') else 'KHONG'}\n"
+            f"Do doi xung (sym)   : {w.get('symmetry',0):.2f}  (binh thuong ~0.30)\n"
+            f"Bien do khong on    : {w.get('amp_cv',0):.1f}%\n"
+            f"Rise / Fall         : {w.get('rise_ms',0):.0f} ms / {w.get('fall_ms',0):.0f} ms\n"
+        )
+        if w.get("warnings"):
+            wave_section += "Canh bao song       : " + " | ".join(w["warnings"]) + "\n"
+        else:
+            wave_section += "Canh bao song       : Khong co bat thuong\n"
     report = (
         f"AI SEPSIS - BAO CAO\n{'='*40}\n"
         f"Ngay      : {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
@@ -951,6 +1160,7 @@ def export_report():
         f"Conf TB mau RISK    : {s['avg_conf_risk']:.1f}%\n"
         f"AI canh bao         : {'CO' if s['ai_high'] else 'KHONG'}\n"
         f"Lam sang bat thuong : {'CO' if s['clin_high'] else 'KHONG'}\n"
+        f"{wave_section}"
         f"\n{'='*40}\n"
         f"KET LUAN: {s['conc']}\n"
         f"Cap cuu : 115\n"
