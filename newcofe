@@ -1309,112 +1309,169 @@ def show_report_window():
     if not s['hrs'] or not s['spo2s']: return
     pname = current_patient[1] if current_patient else "Khong ro"
 
+    # ── Màu sắc báo cáo: trắng/đen, đỏ cho cảnh báo ──────────
+    R_BG    = "#ffffff"   # nền trắng
+    R_TEXT  = "#111111"   # chữ đen
+    R_GRAY  = "#555555"   # nhãn xám
+    R_RED   = "#cc0000"   # cảnh báo đỏ
+    R_GREEN = "#1a7a1a"   # bình thường xanh lá đậm
+    R_BOLD  = "#000000"   # đen đậm
+    R_LINE  = "#cccccc"   # đường kẻ xám nhạt
+    R_HEAD  = "#1a1a2e"   # tiêu đề section nền xanh đậm
+    R_HFONT = "#ffffff"   # chữ tiêu đề section trắng
+
     win = tk.Toplevel(root)
     win.title("Bao Cao Ket Qua Do")
-    win.geometry("500x640")
-    win.configure(bg=BG)
+    win.geometry("520x680")
+    win.configure(bg=R_BG)
+    win.resizable(True, True)
     win.grab_set()
 
-    # Tiêu đề
-    tk.Label(win, text="BAO CAO KET QUA DO",
-             font=("Consolas",14,"bold"), bg=BG, fg=ACC).pack(pady=(16,2))
-    tk.Label(win, text=f"Mo hinh: {s['model_str']}",
-             font=("Consolas",8), bg=BG, fg=PURPLE).pack()
-    tk.Frame(win, bg=ACC, height=2).pack(fill="x", padx=20, pady=(6,0))
+    # ── Header cố định ────────────────────────────────────────
+    hdr_f = tk.Frame(win, bg="#1a1a2e"); hdr_f.pack(fill="x")
+    tk.Label(hdr_f, text="BAO CAO KET QUA DO",
+             font=("Arial",13,"bold"), bg="#1a1a2e", fg="white").pack(side="left", padx=14, pady=10)
+    tk.Label(hdr_f, text=f"Mo hinh: {s['model_str']}",
+             font=("Arial",8), bg="#1a1a2e", fg="#aaaaff").pack(side="right", padx=14)
 
-    info_frame = tk.Frame(win, bg=BG)
-    info_frame.pack(fill="x", padx=24, pady=8)
+    # ── Scrollable body ───────────────────────────────────────
+    body_outer = tk.Frame(win, bg=R_BG); body_outer.pack(fill="both", expand=True)
+    canvas_r   = tk.Canvas(body_outer, bg=R_BG, highlightthickness=0)
+    scrollbar  = ttk.Scrollbar(body_outer, orient="vertical", command=canvas_r.yview)
+    canvas_r.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    canvas_r.pack(side="left",  fill="both", expand=True)
+    body = tk.Frame(canvas_r, bg=R_BG)
+    _body_win = canvas_r.create_window((0,0), window=body, anchor="nw")
+    def _on_resize(e):
+        canvas_r.itemconfig(_body_win, width=e.width)
+    canvas_r.bind("<Configure>", _on_resize)
+    body.bind("<Configure>",
+              lambda e: canvas_r.configure(scrollregion=canvas_r.bbox("all")))
+    # Scroll bằng chuột
+    def _scroll(e):
+        canvas_r.yview_scroll(int(-1*(e.delta/120)), "units")
+    canvas_r.bind_all("<MouseWheel>", _scroll)
 
-    def row(label, value, color=TEXT):
-        r = tk.Frame(info_frame, bg=BG); r.pack(fill="x", pady=2)
-        tk.Label(r, text=f"{label:<24}", font=("Consolas",9),
-                 bg=BG, fg=GRAY).pack(side="left")
-        tk.Label(r, text=value, font=("Consolas",10,"bold"),
-                 bg=BG, fg=color).pack(side="left")
+    # ── Helper functions ──────────────────────────────────────
+    def section(title, warning=False):
+        sf = tk.Frame(body, bg=R_HEAD if not warning else R_RED)
+        sf.pack(fill="x", pady=(10,0))
+        tk.Label(sf, text=f"  {title}",
+                 font=("Arial",9,"bold"), bg=R_HEAD if not warning else R_RED,
+                 fg=R_HFONT).pack(anchor="w", pady=3)
 
-    def section(title):
-        tk.Frame(info_frame, bg=GRAY, height=1).pack(fill="x", pady=(8,4))
-        tk.Label(info_frame, text=title, font=("Consolas",8,"bold"),
-                 bg=BG, fg=ACC).pack(anchor="w")
+    def row(label, value, alert=False, good=False):
+        r = tk.Frame(body, bg=R_BG); r.pack(fill="x", padx=14, pady=1)
+        tk.Label(r, text=f"{label}",  width=26, anchor="w",
+                 font=("Arial",9),    bg=R_BG, fg=R_GRAY).pack(side="left")
+        vc = R_RED if alert else (R_GREEN if good else R_BOLD)
+        tk.Label(r, text=value,
+                 font=("Arial",10,"bold"), bg=R_BG, fg=vc).pack(side="left")
+        # đường kẻ mờ dưới mỗi row
+        tk.Frame(body, bg=R_LINE, height=1).pack(fill="x", padx=14)
 
-    row("Benh nhan",    pname,                                   ACC)
-    row("Thoi luong",   f"{s['duration']//60}p {s['duration']%60}s")
-    row("So mau",       str(s['n_total']))
+    def warn_row(text):
+        r = tk.Frame(body, bg="#fff0f0"); r.pack(fill="x", padx=14, pady=1)
+        tk.Label(r, text=f"  ⚠  {text}",
+                 font=("Arial",9), bg="#fff0f0", fg=R_RED).pack(anchor="w", pady=2)
 
+    # ── THÔNG TIN CHUNG ───────────────────────────────────────
+    section("THONG TIN PHIEN DO")
+    row("Benh nhan",  pname)
+    row("Ngay gio",   datetime.now().strftime("%d/%m/%Y  %H:%M"))
+    row("Thoi luong", f"{s['duration']//60} phut  {s['duration']%60} giay")
+    row("So mau",     f"{s['n_total']} mau")
+
+    # ── CHỈ SỐ LÂM SÀNG ──────────────────────────────────────
     section("CHI SO LAM SANG")
-    row("Nhip tim TB",  f"{s['avg_hr']:.1f} bpm",               ACC)
-    row("  Max / Min",  f"{s['max_hr']:.0f} / {s['min_hr']:.0f} bpm")
-    row("SpO2 TB",      f"{s['avg_spo2']:.1f}%",                GREEN)
-    row("  SpO2 Min",   f"{s['min_spo2']:.1f}%",
-        ACC2 if s['min_spo2']<94 else TEXT)
-    row("Nhiet do TB",  f"{s['avg_temp']:.1f} °C",              WARN)
-    row("Bat thuong LS","CO" if s['clin_high'] else "KHONG",
-        ACC2 if s['clin_high'] else GREEN)
+    row("Nhip tim TB",   f"{s['avg_hr']:.1f} bpm",
+        alert=(s['avg_hr']>100 or s['avg_hr']<50),
+        good=(50<=s['avg_hr']<=100))
+    row("  Max / Min",   f"{s['max_hr']:.0f} / {s['min_hr']:.0f} bpm")
+    row("SpO2 trung binh", f"{s['avg_spo2']:.1f}%",
+        alert=s['avg_spo2']<94, good=s['avg_spo2']>=94)
+    row("  SpO2 thap nhat", f"{s['min_spo2']:.1f}%",
+        alert=s['min_spo2']<94)
+    row("Nhiet do TB",   f"{s['avg_temp']:.1f} °C",
+        alert=(s['avg_temp']>=38.3 or s['avg_temp']<35),
+        good=(35<=s['avg_temp']<38.3))
+    row("Bat thuong LS", "CO" if s['clin_high'] else "KHONG",
+        alert=s['clin_high'], good=not s['clin_high'])
+    if s['temp_warn']:
+        warn_row(f"Nhiet {s['avg_temp']:.1f}°C bat thuong — kiem tra sensor!")
 
+    # ── ĐÁNH GIÁ AI ──────────────────────────────────────────
     section("DANH GIA AI")
-    row("Ty le mau RISK",
-        f"{s['rr']:.1f}%  ({s['n_risk']}/{s['n_total']} mau)",
-        ACC2 if s['rr']>30 else GREEN)
-    row("Conf TB toan phien", f"{s['avg_conf']:.1f}%")
-    row("Conf TB mau RISK",
-        f"{s['avg_conf_risk']:.1f}%",
-        ACC2 if s['avg_conf_risk']>70 else WARN if s['avg_conf_risk']>50 else GREEN)
-    row("CNN-BiLSTM score",
+    row("Ty le mau RISK",    f"{s['rr']:.1f}%  ({s['n_risk']}/{s['n_total']})",
+        alert=s['rr']>30, good=s['rr']<=30)
+    row("Conf trung binh",   f"{s['avg_conf']:.1f}%")
+    row("Conf mau RISK",     f"{s['avg_conf_risk']:.1f}%",
+        alert=s['avg_conf_risk']>70)
+    row(f"{DL_MODEL_NAME} score",
         f"{s['last_dl']:.3f}  ({'RISK' if s['last_dl']>0.5 else 'NORMAL'})",
-        ACC2 if s['last_dl']>0.5 else GREEN)
+        alert=s['last_dl']>0.5, good=s['last_dl']<=0.5)
     row("XGBoost score",
         f"{s['last_xgb']:.3f}  ({'RISK' if s['last_xgb']>0.5 else 'NORMAL'})",
-        ACC2 if s['last_xgb']>0.5 else GREEN)
+        alert=s['last_xgb']>0.5, good=s['last_xgb']<=0.5)
     row("AI canh bao",  "CO" if s['ai_high'] else "KHONG",
-        ACC2 if s['ai_high'] else GREEN)
-    if s['temp_warn']:
-        tk.Label(info_frame,
-                 text=f"  ⚠ Nhiet do {s['avg_temp']:.1f}°C bat thuong — kiem tra sensor nhiet!",
-                 font=("Consolas",8), bg=BG, fg=ACC2).pack(anchor="w")
+        alert=s['ai_high'], good=not s['ai_high'])
 
-    # ── Phân tích sóng ──────────────────────────────────────
+    # ── PHÂN TÍCH SÓNG ───────────────────────────────────────
     if _last_wave:
         w = _last_wave
         section("PHAN TICH SONG MACH")
-        qc = GREEN if w["quality"]=="GOOD" else WARN if w["quality"]=="FAIR" else ACC2
-        rc = GREEN if w["rhythm"]=="REGULAR" else ACC2 if w["rhythm"]=="IRREGULAR" else WARN
-        nc = GREEN if w["notch"] else WARN
-        row("Chat luong tin hieu", w["quality"], qc)
-        row("Nhip",               w["rhythm"],  rc)
-        row("HRV",                f"{w['hrv_ms']:.1f} ms",
-            ACC2 if w["hrv_ms"]>80 else GREEN)
-        row("Dicrotic notch",     "CO" if w["notch"] else "KHONG", nc)
-        row("Symmetry (rise/tot)",f"{w['symmetry']:.2f}",
-            WARN if w["symmetry"]>0.50 or w["symmetry"]<0.15 else GREEN)
-        row("Bien do khong on",   f"{w['amp_cv']:.1f}%",
-            ACC2 if w["amp_cv"]>25 else GREEN)
-        row("Rise / Fall",        f"{w['rise_ms']:.0f} / {w['fall_ms']:.0f} ms")
-        if w["warnings"]:
-            for wn in w["warnings"]:
-                tk.Label(info_frame, text=f"  ⚠ {wn}",
-                         font=("Consolas",8), bg=BG, fg=ACC2).pack(anchor="w")
+        row("Chat luong",       w["quality"],
+            alert=w["quality"]=="POOR", good=w["quality"]=="GOOD")
+        row("Nhip",             w["rhythm"],
+            alert=w["rhythm"]=="IRREGULAR", good=w["rhythm"]=="REGULAR")
+        row("HRV",              f"{w['hrv_ms']:.1f} ms",
+            alert=w["hrv_ms"]>80)
+        row("Dicrotic notch",   "CO" if w["notch"] else "KHONG",
+            alert=not w["notch"], good=w["notch"])
+        row("Symmetry",         f"{w['symmetry']:.2f}",
+            alert=(w["symmetry"]>0.50 or w["symmetry"]<0.15))
+        row("Bien do khong on", f"{w['amp_cv']:.1f}%",
+            alert=w["amp_cv"]>25)
+        row("Rise / Fall",      f"{w['rise_ms']:.0f} / {w['fall_ms']:.0f} ms")
+        for wn in w.get("warnings", []):
+            warn_row(wn)
 
-    # Kết luận
-    tk.Frame(info_frame, bg=ACC2 if "CAO" in s['conc'] else GREEN,
-             height=2).pack(fill="x", pady=(10,4))
-    conc_color = ACC2 if "CAO" in s['conc'] else (WARN if "TRUNG BINH" in s['conc'] else GREEN)
-    tk.Label(win, text=f"KET LUAN:  {s['conc']}",
-             font=("Consolas",11,"bold"), bg=BG, fg=conc_color).pack(pady=4)
+    # ── KẾT LUẬN ─────────────────────────────────────────────
+    is_high = "CAO" in s['conc']
+    is_mid  = "TRUNG BINH" in s['conc']
+    conc_bg = R_RED if is_high else ("#e65c00" if is_mid else "#1a7a1a")
+    tk.Frame(body, bg=conc_bg, height=4).pack(fill="x", pady=(14,0))
+    cf = tk.Frame(body, bg=conc_bg); cf.pack(fill="x")
+    tk.Label(cf, text=f"  KET LUAN:  {s['conc']}",
+             font=("Arial",12,"bold"), bg=conc_bg, fg="white").pack(
+             anchor="w", pady=10, padx=14)
+    if is_high:
+        tk.Label(body, text="  ⚠  De nghi chuyen tuyen va theo doi sat!",
+                 font=("Arial",9,"bold"), bg="#fff0f0", fg=R_RED).pack(
+                 anchor="w", padx=14, pady=4)
+    elif is_mid:
+        tk.Label(body, text="  ℹ  Theo doi them, kiem tra lai chi so lam sang",
+                 font=("Arial",9), bg="#fff8e1", fg="#b36b00").pack(
+                 anchor="w", padx=14, pady=4)
+    else:
+        tk.Label(body, text="  ✓  Cac chi so trong gioi han binh thuong",
+                 font=("Arial",9), bg="#f0fff0", fg=R_GREEN).pack(
+                 anchor="w", padx=14, pady=4)
 
-    if "CAO" in s['conc']:
-        tk.Label(win, text="⚠  De nghi theo doi va tu van bac si",
-                 font=("Consolas",9), bg=BG, fg=WARN).pack()
-    elif "TRUNG BINH" in s['conc']:
-        tk.Label(win, text="ℹ  Chi so lam sang can theo doi them",
-                 font=("Consolas",9), bg=BG, fg=WARN).pack()
+    # Padding cuối
+    tk.Frame(body, bg=R_BG, height=20).pack()
 
-    btn_row = tk.Frame(win, bg=BG); btn_row.pack(pady=14)
+    # ── Nút hành động cố định dưới cùng ──────────────────────
+    foot = tk.Frame(win, bg="#eeeeee"); foot.pack(fill="x", side="bottom")
+    tk.Frame(foot, bg=R_LINE, height=1).pack(fill="x")
+    btn_row = tk.Frame(foot, bg="#eeeeee"); btn_row.pack(pady=8)
     tk.Button(btn_row, text="Xuat File .txt", command=export_report,
-              bg=CARD, fg=ACC, font=("Consolas",9,"bold"),
-              relief="flat", padx=12, pady=4, cursor="hand2").pack(side="left", padx=8)
+              bg="#1a1a2e", fg="white", font=("Arial",9,"bold"),
+              relief="flat", padx=14, pady=5, cursor="hand2").pack(side="left", padx=8)
     tk.Button(btn_row, text="Dong", command=win.destroy,
-              bg=CARD, fg=GRAY, font=("Consolas",9,"bold"),
-              relief="flat", padx=12, pady=4, cursor="hand2").pack(side="left", padx=8)
+              bg="#888888", fg="white", font=("Arial",9,"bold"),
+              relief="flat", padx=14, pady=5, cursor="hand2").pack(side="left", padx=8)
 
 # ================================================================
 #  RUN
