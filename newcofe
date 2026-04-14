@@ -28,16 +28,33 @@ from matplotlib.figure import Figure
 try:
     import tensorflow as tf
     dl_model = tf.keras.models.load_model("cnn_bilstm_attention.h5")
-    print("DL Model loaded")
+    # ── Chẩn đoán model ──────────────────────────────────────
+    _n_inputs  = len(dl_model.inputs)
+    _n_outputs = len(dl_model.outputs)
+    _layers    = [l.__class__.__name__ for l in dl_model.layers]
+    _has_cnn   = any("Conv" in l for l in _layers)
+    _has_lstm  = any("LSTM" in l or "lstm" in l for l in _layers)
+    _has_attn  = any("Attention" in l or "attention" in l for l in _layers)
+    print("=" * 50)
+    print(f"[MODEL] CNN-BiLSTM loaded OK")
+    print(f"  Input(s)  : {_n_inputs}  | Output(s): {_n_outputs}")
+    print(f"  CNN layer : {'YES' if _has_cnn  else 'NO'}")
+    print(f"  BiLSTM    : {'YES' if _has_lstm else 'NO'}")
+    print(f"  Attention : {'YES' if _has_attn else 'NO'}")
+    print(f"  Layers    : {_layers}")
+    print("=" * 50)
+    DL_N_INPUTS = _n_inputs   # lưu lại để dùng khi predict
 except Exception as e:
-    dl_model = None; print(f"DL: {e}")
+    dl_model = None; DL_N_INPUTS = 1
+    print(f"[MODEL] DL load FAIL: {e}")
 
 try:
     import joblib
     xgb_model = joblib.load("xgb_sepsis.pkl")
-    print("XGBoost loaded")
-except Exception:
+    print(f"[MODEL] XGBoost loaded OK | n_features={xgb_model.n_features_in_}")
+except Exception as e:
     xgb_model = None
+    print(f"[MODEL] XGBoost load FAIL: {e}")
 
 try:
     from bleak import BleakScanner, BleakClient
@@ -1234,6 +1251,28 @@ def show_report_window():
         ACC2 if s['avg_conf_risk']>70 else WARN if s['avg_conf_risk']>50 else GREEN)
     row("AI canh bao",  "CO" if s['ai_high'] else "KHONG",
         ACC2 if s['ai_high'] else GREEN)
+
+    # ── Phân tích sóng ──────────────────────────────────────
+    if _last_wave:
+        w = _last_wave
+        section("PHAN TICH SONG MACH")
+        qc = GREEN if w["quality"]=="GOOD" else WARN if w["quality"]=="FAIR" else ACC2
+        rc = GREEN if w["rhythm"]=="REGULAR" else ACC2 if w["rhythm"]=="IRREGULAR" else WARN
+        nc = GREEN if w["notch"] else WARN
+        row("Chat luong tin hieu", w["quality"], qc)
+        row("Nhip",               w["rhythm"],  rc)
+        row("HRV",                f"{w['hrv_ms']:.1f} ms",
+            ACC2 if w["hrv_ms"]>80 else GREEN)
+        row("Dicrotic notch",     "CO" if w["notch"] else "KHONG", nc)
+        row("Symmetry (rise/tot)",f"{w['symmetry']:.2f}",
+            WARN if w["symmetry"]>0.50 or w["symmetry"]<0.15 else GREEN)
+        row("Bien do khong on",   f"{w['amp_cv']:.1f}%",
+            ACC2 if w["amp_cv"]>25 else GREEN)
+        row("Rise / Fall",        f"{w['rise_ms']:.0f} / {w['fall_ms']:.0f} ms")
+        if w["warnings"]:
+            for wn in w["warnings"]:
+                tk.Label(info_frame, text=f"  ⚠ {wn}",
+                         font=("Consolas",8), bg=BG, fg=ACC2).pack(anchor="w")
 
     # Kết luận
     tk.Frame(info_frame, bg=ACC2 if "CAO" in s['conc'] else GREEN,
