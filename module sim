@@ -2,122 +2,303 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <HardwareSerial.h>
+#include <Preferences.h>
 
 // ════════════════════════════════════════════════
-//  CẤU HÌNH — SỬA TRƯỚC KHI NẠP
+//  API KEY — đổi thành chuỗi bí mật của bạn
+//  Python phải gửi header: X-API-Key: <key này>
 // ════════════════════════════════════════════════
-#define WIFI_SSID      "Ten_WiFi_cua_ban"
-#define WIFI_PASS      "Mat_khau_WiFi"
-#define DEFAULT_PHONE  "0901234567"
+#define API_KEY  "SepsisAI_S3_2024_XK9!"
 
-// A7680C UART
-#define SIM_RX    20
-#define SIM_TX    21
+// ════════════════════════════════════════════════
+//  PIN
+// ════════════════════════════════════════════════
+#define SIM_RX    16
+#define SIM_TX    17
+#define SIM_RST   4
 #define SIM_BAUD  115200
+#define DEFAULT_PHONE  "0899145316"
+
+#define AP_SSID  "UBND123"
+#define AP_PASS  "12345678"
 
 // ════════════════════════════════════════════════
 //  OBJECTS
 // ════════════════════════════════════════════════
 WebServer      server(80);
 HardwareSerial simSerial(1);
-bool simOK = false;
+Preferences    prefs;
+
+bool simOK   = false;
+bool staMode = false;
+
+String savedSSID = "";
+String savedPASS = "";
+
+// ════════════════════════════════════════════════
+//  KIỂM TRA API KEY
+//  Mọi request đều phải qua hàm này trước
+// ════════════════════════════════════════════════
+bool checkAPIKey() {
+  // Cho phép truy cập trang / và /wifi không cần key
+  // (để cấu hình lần đầu từ trình duyệt)
+  String path = server.uri();
+  if (path == "/" || path == "/wifi") return true;
+
+  // Các endpoint còn lại phải có key
+  if (!server.hasHeader("X-API-Key")) {
+    Serial.println("BLOCKED: Thieu API Key - " + server.client().remoteIP().toString());
+    server.send(401, "application/json",
+      "{\"error\":\"Thieu X-API-Key header\"}");
+    return false;
+  }
+
+  String key = server.header("X-API-Key");
+  if (key != API_KEY) {
+    Serial.println("BLOCKED: Sai API Key tu " +
+                   server.client().remoteIP().toString() +
+                   " key=" + key);
+    server.send(403, "application/json",
+      "{\"error\":\"API Key sai\"}");
+    return false;
+  }
+
+  return true;  // key đúng
+}
+
+// ════════════════════════════════════════════════
+//  WiFi FLASH
+// ════════════════════════════════════════════════
+void loadWiFiCreds() {
+  prefs.begin("wifi", true);
+  savedSSID = prefs.getString("ssid", "");
+  savedPASS = prefs.getString("pass", "");
+  prefs.end();
+  Serial.println("WiFi da luu: " + savedSSID);
+}
+
+void saveWiFiCreds(String ssid, String pass) {
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+  savedSSID = ssid; savedPASS = pass;
+  Serial.println("Da luu WiFi: " + ssid);
+}
+
+// ════════════════════════════════════════════════
+//  WiFi STA / AP
+// ════════════════════════════════════════════════
+bool connectWiFiSTA(String ssid, String pass) {
+  Serial.println("Ket noi WiFi: " + ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    delay(500); Serial.print("."); retry++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi OK! IP: " + WiFi.localIP().toString());
+    Serial.println(">>> ESP32_S3_IP = \"" +
+                   WiFi.localIP().toString() + "\" <<<");
+    staMode = true; return true;
+  }
+  Serial.println("\nWiFi FAIL!"); staMode = false; return false;
+}
+
+void startAPMode() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.println("AP Mode: " + String(AP_SSID));
+  Serial.println("IP: " + WiFi.softAPIP().toString());
+  staMode = false;
+}
 
 // ════════════════════════════════════════════════
 //  AT COMMAND
 // ════════════════════════════════════════════════
-String simAT(const char* cmd, uint32_t timeout = 2000) {
+String simAT(const String& cmd, uint32_t timeout = 3000) {
   simSerial.println(cmd);
+  Serial.print(">>> "); Serial.println(cmd);
   String resp = "";
-  unsigned long t = millis();
-  while (millis() - t < timeout) {
+  uint32_t t = millis();
+  while (millis()-t < timeout) {
     while (simSerial.available())
       resp += (char)simSerial.read();
-    if (resp.indexOf("OK")    > -1 ||
-        resp.indexOf("ERROR") > -1) break;
+    if (resp.indexOf("OK")    != -1 ||
+        resp.indexOf("ERROR") != -1) break;
   }
-  Serial.println("SIM << " + resp);
+  Serial.print("<<< "); Serial.println(resp);
   return resp;
 }
 
 // ════════════════════════════════════════════════
-//  KHỞI ĐỘNG SIM
+//  RESET SIM
 // ════════════════════════════════════════════════
+void simHardReset() {
+  Serial.println("Hard reset A7680C...");
+  digitalWrite(SIM_RST, LOW);  delay(500);
+  digitalWrite(SIM_RST, HIGH); delay(8000);
+  Serial.println("Module san sang!");
+}
+
+bool simCheckReady() {
+  if (simAT("AT").indexOf("OK") == -1) return false;
+  if (simAT("AT+CPIN?").indexOf("READY") == -1) return false;
+  simAT("AT+CSQ");
+  String reg = simAT("AT+CREG?");
+  return (reg.indexOf(",1") != -1 || reg.indexOf(",5") != -1);
+}
+
 bool simInit() {
   Serial.println("Khoi dong A7680C...");
-  delay(3000);
-  for (int i = 0; i < 5; i++) {
-    if (simAT("AT").indexOf("OK") > -1) {
-      simAT("ATE0");
-      simAT("AT+CMGF=1");
-      simAT("AT+CSCS=\"GSM\"");
-      Serial.println("A7680C OK!");
-      return true;
-    }
-    delay(1000);
+  if (simCheckReady()) {
+    simAT("AT+CMGF=1"); simAT("AT+CSCS=\"GSM\"");
+    Serial.println("A7680C OK!"); return true;
   }
-  Serial.println("A7680C FAIL!");
-  return false;
+  simHardReset();
+  if (simCheckReady()) {
+    simAT("AT+CMGF=1"); simAT("AT+CSCS=\"GSM\"");
+    Serial.println("A7680C OK sau reset!"); return true;
+  }
+  Serial.println("A7680C FAIL!"); return false;
 }
 
 // ════════════════════════════════════════════════
-//  GỬI SMS
+//  GỬI SMS — giống code hoạt động
 // ════════════════════════════════════════════════
 bool sendSMS(String phone, String msg) {
   if (!simOK) {
-    Serial.println("SIM chua san sang");
-    return false;
+    Serial.println("SIM chua san sang"); return false;
   }
-
-  // Chuẩn hoá số điện thoại
   if (phone.startsWith("84")) phone = "0" + phone.substring(2);
   if (!phone.startsWith("0")) phone = "0" + phone;
-
   Serial.println("Gui SMS den: " + phone);
-  Serial.println("Noi dung: " + msg);
 
-  simAT("AT+CMGF=1");
+  simAT("AT+CMGF=1", 1000);
+  simAT("AT+CSCS=\"GSM\"", 1000);
+
   simSerial.println("AT+CMGS=\"" + phone + "\"");
-  delay(500);
+  Serial.println(">>> AT+CMGS=\"" + phone + "\"");
+  delay(1500);
+
+  // Chờ dấu ">"
+  String prompt = "";
+  uint32_t t = millis();
+  while (millis()-t < 3000) {
+    while (simSerial.available())
+      prompt += (char)simSerial.read();
+    if (prompt.indexOf(">") != -1) break;
+  }
+  if (prompt.indexOf(">") == -1) {
+    Serial.println("Khong nhan duoc '>'!"); return false;
+  }
+
   simSerial.print(msg);
-  simSerial.write(26);   // Ctrl+Z = gửi
-  delay(4000);
-  Serial.println("SMS da gui!");
-  return true;
+  delay(500);
+  simSerial.write(26);  // Ctrl+Z
+
+  // Chờ +CMGS: tối đa 15s
+  String result = "";
+  t = millis();
+  while (millis()-t < 15000) {
+    while (simSerial.available())
+      result += (char)simSerial.read();
+    if (result.indexOf("+CMGS:") != -1) break;
+    if (result.indexOf("ERROR")  != -1) break;
+  }
+  Serial.println("<<< " + result);
+
+  if (result.indexOf("+CMGS:") != -1) {
+    Serial.println("SMS OK!"); return true;
+  }
+  Serial.println("SMS FAIL!"); return false;
 }
 
 // ════════════════════════════════════════════════
 //  WEB ROUTES
 // ════════════════════════════════════════════════
 
-// GET / — trang kiểm tra
+// GET / — trang chủ + form WiFi (không cần key)
 void handleRoot() {
-  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  html += "<title>SepsisAI SMS Gateway</title>";
-  html += "<style>body{font-family:monospace;background:#080c14;color:#00e5ff;padding:20px}";
-  html += "h2{color:#00ff9f}.ok{color:#00ff9f}.fail{color:#ff4d6d}</style></head><body>";
-  html += "<h2>SepsisAI SMS Gateway</h2>";
-  html += "<p>SIM: <span class='" + String(simOK?"ok":"fail") + "'>" + String(simOK?"OK":"FAIL") + "</span></p>";
-  html += "<p>IP: " + WiFi.localIP().toString() + "</p>";
-  html += "<hr><p><b>Endpoints:</b></p>";
-  html += "<p>POST /sms &nbsp;&nbsp;→ gui SMS tuy chinh</p>";
-  html += "<p>POST /alert &nbsp;→ canh bao nguy co</p>";
-  html += "<p>POST /report → bao cao sau lan do</p>";
-  html += "<p>GET  /status → kiem tra SIM</p>";
-  html += "</body></html>";
+  String ip   = staMode ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  String mode = staMode ? "STA" : "AP";
+
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>SepsisAI SMS Gateway</title>"
+    "<style>body{font-family:monospace;background:#080c14;color:#e0e8f0;padding:20px}"
+    "h2{color:#00ff9f}.ok{color:#00ff9f}.fail{color:#ff4d6d}.warn{color:#ffb703}"
+    "input{background:#131d2e;color:#e0e8f0;border:1px solid #4a5568;"
+    "padding:6px;border-radius:4px;width:220px;margin:4px}"
+    "button{background:#00e5ff;color:#080c14;border:none;padding:8px 16px;"
+    "border-radius:4px;cursor:pointer;font-weight:bold;margin:4px}"
+    ".card{background:#0f1624;border-radius:8px;padding:12px;margin:10px 0}"
+    "</style></head><body><h2>SepsisAI SMS Gateway</h2>";
+
+  html += "<div class='card'>";
+  html += "<p>Mode: <b class='" + String(staMode?"ok":"warn") + "'>" + mode + "</b></p>";
+  html += "<p>IP: <b>" + ip + "</b></p>";
+  html += "<p>SIM: <b class='" + String(simOK?"ok":"fail") + "'>" +
+          String(simOK?"OK":"FAIL") + "</b></p>";
+  html += "<p>WiFi: <b>" + (savedSSID.length()>0?savedSSID:"chua co") + "</b></p>";
+  html += "<p class='warn'>API Key bao mat: can X-API-Key header</p></div>";
+
+  html += "<div class='card'><b class='warn'>Cau hinh WiFi:</b><br><br>"
+    "<form action='/wifi' method='POST'>"
+    "SSID: <input type='text' name='ssid'><br>"
+    "Pass: <input type='password' name='pass'><br><br>"
+    "<button type='submit'>Luu va Khoi Dong Lai</button>"
+    "</form></div>"
+    "<div class='card'><b>API Endpoints (can X-API-Key):</b><br>"
+    "POST /sms &nbsp;&nbsp;→ gui SMS tuy chinh<br>"
+    "POST /alert &nbsp;→ canh bao<br>"
+    "POST /report → bao cao<br>"
+    "GET  /status → trang thai<br>"
+    "POST /reset_sim → reset A7680C"
+    "</div></body></html>";
+
   server.send(200, "text/html", html);
 }
 
+// POST /wifi (không cần key)
+void handleWiFiConfig() {
+  String ssid = "", pass = "";
+  if (server.hasArg("plain")) {
+    StaticJsonDocument<256> doc;
+    if (!deserializeJson(doc, server.arg("plain"))) {
+      ssid = doc["ssid"] | ""; pass = doc["pass"] | "";
+    }
+  }
+  if (ssid.isEmpty() && server.hasArg("ssid")) {
+    ssid = server.arg("ssid"); pass = server.arg("pass");
+  }
+  if (ssid.isEmpty()) {
+    server.send(400, "application/json", "{\"error\":\"Thieu SSID\"}"); return;
+  }
+  saveWiFiCreds(ssid, pass);
+  if (server.hasArg("ssid")) {
+    server.send(200, "text/html",
+      "<html><body style='font-family:monospace;background:#080c14;"
+      "color:#00ff9f;padding:20px'><h2>Da luu!</h2>"
+      "<p>Dang ket noi: <b>" + ssid + "</b></p>"
+      "<p>Khoi dong lai sau 3 giay...</p></body></html>");
+  } else {
+    server.send(200, "application/json",
+      "{\"status\":\"saved\",\"ssid\":\"" + ssid + "\"}");
+  }
+  delay(500); ESP.restart();
+}
+
 // POST /sms
-// {"phone":"0901234567","message":"noi dung"}
 void handleSMS() {
+  if (!checkAPIKey()) return;
   if (!server.hasArg("plain")) {
-    server.send(400, "application/json", "{\"error\":\"No body\"}");
-    return;
+    server.send(400, "application/json", "{\"error\":\"No body\"}"); return;
   }
   StaticJsonDocument<512> doc;
   if (deserializeJson(doc, server.arg("plain"))) {
-    server.send(400, "application/json", "{\"error\":\"Bad JSON\"}");
-    return;
+    server.send(400, "application/json", "{\"error\":\"Bad JSON\"}"); return;
   }
   String phone = doc["phone"]   | DEFAULT_PHONE;
   String msg   = doc["message"] | "SepsisAI SMS";
@@ -127,30 +308,27 @@ void handleSMS() {
 }
 
 // POST /alert
-// {"phone":"...","patient":"Ten BN","alert":"noi dung","hr":130,"spo2":86,"temp":38.9}
 void handleAlert() {
+  if (!checkAPIKey()) return;
   if (!server.hasArg("plain")) {
-    server.send(400, "application/json", "{\"error\":\"No body\"}");
-    return;
+    server.send(400, "application/json", "{\"error\":\"No body\"}"); return;
   }
   StaticJsonDocument<512> doc;
   if (deserializeJson(doc, server.arg("plain"))) {
-    server.send(400, "application/json", "{\"error\":\"Bad JSON\"}");
-    return;
+    server.send(400, "application/json", "{\"error\":\"Bad JSON\"}"); return;
   }
   String phone   = doc["phone"]   | DEFAULT_PHONE;
   String patient = doc["patient"] | "Benh nhan";
-  String alert   = doc["alert"]   | "Nguy co cao";
+  String alert_  = doc["alert"]   | "Nguy co cao";
   int    hr      = doc["hr"]      | 0;
   int    spo2    = doc["spo2"]    | 0;
   float  temp    = doc["temp"]    | 0.0f;
 
   String msg = "CANH BAO SEPSIS AI\n";
-  msg += "BN: "    + patient + "\n";
-  msg += alert     + "\n";
-  if (hr   > 0) msg += "HR: "   + String(hr)        + " bpm\n";
-  if (spo2 > 0) msg += "SpO2: " + String(spo2)      + "%\n";
-  if (temp > 0) msg += "Nhiet: "+ String(temp, 1)   + "C\n";
+  msg += "BN: " + patient + "\n" + alert_ + "\n";
+  if (hr   > 0) msg += "HR: "    + String(hr)     + " bpm\n";
+  if (spo2 > 0) msg += "SpO2: "  + String(spo2)   + "%\n";
+  if (temp > 0) msg += "Nhiet: " + String(temp,1) + "C\n";
   msg += "Kiem tra ngay!";
 
   bool ok = sendSMS(phone, msg);
@@ -159,17 +337,14 @@ void handleAlert() {
 }
 
 // POST /report
-// {"phone":"...","patient":"...","hr":72,"spo2":98,"temp":36.5,
-//  "risk_rate":5.2,"conclusion":"NGUY CO THAP","samples":120}
 void handleReport() {
+  if (!checkAPIKey()) return;
   if (!server.hasArg("plain")) {
-    server.send(400, "application/json", "{\"error\":\"No body\"}");
-    return;
+    server.send(400, "application/json", "{\"error\":\"No body\"}"); return;
   }
   StaticJsonDocument<512> doc;
   if (deserializeJson(doc, server.arg("plain"))) {
-    server.send(400, "application/json", "{\"error\":\"Bad JSON\"}");
-    return;
+    server.send(400, "application/json", "{\"error\":\"Bad JSON\"}"); return;
   }
   String phone      = doc["phone"]      | DEFAULT_PHONE;
   String patient    = doc["patient"]    | "Benh nhan";
@@ -194,17 +369,30 @@ void handleReport() {
     ok ? "{\"status\":\"report_sent\"}" : "{\"status\":\"failed\"}");
 }
 
-// GET /status — kiểm tra SIM
+// GET /status
 void handleStatus() {
+  if (!checkAPIKey()) return;
   String net  = simAT("AT+CREG?", 1000);
   String csq  = simAT("AT+CSQ",   1000);
-  bool   conn = (net.indexOf(",1") > -1 || net.indexOf(",5") > -1);
+  bool   conn = (net.indexOf(",1")!=-1 || net.indexOf(",5")!=-1);
+  String ip   = staMode ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   String json = "{";
-  json += "\"sim_ok\":"  + String(simOK ? "true" : "false") + ",";
-  json += "\"network_ok\":" + String(conn ? "true" : "false") + ",";
-  json += "\"signal\":\"" + csq.substring(0, min((int)csq.length(), 20)) + "\"";
+  json += "\"sim_ok\":"      + String(simOK?"true":"false")  + ",";
+  json += "\"network_ok\":"  + String(conn?"true":"false")   + ",";
+  json += "\"wifi_mode\":\""  + String(staMode?"STA":"AP")   + "\",";
+  json += "\"ip\":\""         + ip                           + "\",";
+  json += "\"wifi_ssid\":\""  + savedSSID                    + "\",";
+  json += "\"signal\":\""     + csq.substring(0,20)          + "\"";
   json += "}";
   server.send(200, "application/json", json);
+}
+
+// POST /reset_sim
+void handleResetSIM() {
+  if (!checkAPIKey()) return;
+  simHardReset(); simOK = simInit();
+  server.send(200, "application/json",
+    simOK ? "{\"status\":\"sim_ok\"}" : "{\"status\":\"sim_fail\"}");
 }
 
 void handleNotFound() {
@@ -217,42 +405,43 @@ void handleNotFound() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-
   Serial.println("=== SepsisAI SMS Gateway ===");
-  Serial.println("Ket noi WiFi: " + String(WIFI_SSID));
 
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 30) {
-    delay(500);
-    Serial.print(".");
-    retry++;
-  }
+  pinMode(SIM_RST, OUTPUT);
+  digitalWrite(SIM_RST, HIGH);
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi OK!");
-    Serial.println(">>> IP: " + WiFi.localIP().toString() + " <<<");
-    Serial.println(">>> Dien IP nay vao Python: ESP32_S3_IP = \"" +
-                   WiFi.localIP().toString() + "\" <<<");
+  loadWiFiCreds();
+
+  if (savedSSID.length() > 0) {
+    if (!connectWiFiSTA(savedSSID, savedPASS)) startAPMode();
   } else {
-    Serial.println("\nWiFi FAIL! Kiem tra SSID/Pass");
+    startAPMode();
   }
 
-  // A7680C
   simSerial.begin(SIM_BAUD, SERIAL_8N1, SIM_RX, SIM_TX);
   simOK = simInit();
 
-  // Routes
-  server.on("/",        HTTP_GET,  handleRoot);
-  server.on("/sms",     HTTP_POST, handleSMS);
-  server.on("/alert",   HTTP_POST, handleAlert);
-  server.on("/report",  HTTP_POST, handleReport);
-  server.on("/status",  HTTP_GET,  handleStatus);
+  // Khai báo header X-API-Key để WebServer có thể đọc
+  const char* headers[] = {"X-API-Key"};
+  server.collectHeaders(headers, 1);
+
+  server.on("/",          HTTP_GET,  handleRoot);
+  server.on("/wifi",      HTTP_POST, handleWiFiConfig);
+  server.on("/sms",       HTTP_POST, handleSMS);
+  server.on("/alert",     HTTP_POST, handleAlert);
+  server.on("/report",    HTTP_POST, handleReport);
+  server.on("/status",    HTTP_GET,  handleStatus);
+  server.on("/reset_sim", HTTP_POST, handleResetSIM);
   server.onNotFound(handleNotFound);
   server.begin();
 
   Serial.println("Web server OK — port 80");
-  Serial.println("San sang nhan lenh tu Python!");
+  Serial.println("API Key: " + String(API_KEY));
+  if (staMode)
+    Serial.println(">>> ESP32_S3_IP = \"" + WiFi.localIP().toString() + "\" <<<");
+  else
+    Serial.println(">>> AP: " + String(AP_SSID) + " / 192.168.4.1 <<<");
+  Serial.println("San sang!");
 }
 
 // ════════════════════════════════════════════════
@@ -261,10 +450,12 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // Tự động reconnect WiFi nếu mất kết nối
-  if (WiFi.status() != WL_CONNECTED) {
+  // Forward Serial ↔ A7680C (debug AT command)
+  while (Serial.available())    simSerial.write(Serial.read());
+  while (simSerial.available()) Serial.write(simSerial.read());
+
+  if (staMode && WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi mat ket noi, thu lai...");
-    WiFi.reconnect();
-    delay(5000);
+    WiFi.reconnect(); delay(5000);
   }
 }
